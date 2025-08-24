@@ -1,7 +1,7 @@
 import os, time, json, threading, re
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
-import email.utils as eut  # para parsear pubDate RFC2822
+import email.utils as eut  # RFC-2822
 import requests
 from bs4 import BeautifulSoup
 from readability import Document
@@ -16,13 +16,17 @@ KEYWORDS = [k.strip() for k in os.environ.get("KEYWORDS", "").split(",") if k.st
 # IA opcional (TextSynth). Se vazio, publica texto limpo.
 TEXTSYNTH_KEY = os.environ.get("TEXTSYNTH_KEY", "")
 
-# Janela de recência: só aceitar itens com pubDate dentro dessas horas
-RECENT_HOURS = int(os.environ.get("RECENT_HOURS", "12"))  # padrão 12h
+# Janela de recência: só aceitar itens com data dentro dessas horas
+RECENT_HOURS = int(os.environ.get("RECENT_HOURS", "12"))  # ex.: 3 para esportes
 
 # Agendador
-SCRAPE_INTERVAL = int(os.environ.get("SCRAPE_INTERVAL", "300"))  # 5min
-WAIT_GNEWS = int(os.environ.get("WAIT_GNEWS", "20"))             # espera para news.google.com
+SCRAPE_INTERVAL = int(os.environ.get("SCRAPE_INTERVAL", "300"))  # 5 min
+WAIT_GNEWS = int(os.environ.get("WAIT_GNEWS", "20"))             # espera p/ news.google.com
 TIMEOUT = int(os.environ.get("TIMEOUT", "30"))
+
+# Requisitos mínimos do conteúdo (mais amigáveis a notas esportivas)
+MIN_CHARS = int(os.environ.get("MIN_CHARS", "220"))
+MIN_PARAGRAPHS = int(os.environ.get("MIN_PARAGRAPHS", "2"))
 
 # Categoria por cidade (ajuste se quiser)
 CITY_CATEGORY = {
@@ -69,6 +73,9 @@ def http_get(url, timeout=TIMEOUT, allow_redirects=True, accept=None):
 def extract_plain(html: str) -> str:
     soup = BeautifulSoup(html or "", "lxml")
     return soup.get_text(" ", strip=True)
+
+def count_paragraphs(html: str) -> int:
+    return len(re.findall(r"<p\b[^>]*>.*?</p>", html or "", flags=re.I | re.S))
 
 def clean_html(html: str) -> str:
     if not html:
@@ -132,20 +139,35 @@ def build_json(title: str, html: str, img: str, source: str):
         "generated_at": datetime.now(timezone.utc).isoformat()
     }
 
-def is_recent(pub_dt: datetime, now_utc: datetime, max_hours: int) -> bool:
-    if not isinstance(pub_dt, datetime): return False
-    if pub_dt.tzinfo is None:  # assume UTC se vier sem timezone
-        pub_dt = pub_dt.replace(tzinfo=timezone.utc)
-    delta = now_utc - pub_dt.astimezone(timezone.utc)
-    return timedelta(0) <= delta <= timedelta(hours=max_hours)
-
-def parse_rfc2822(dt_text: str):
+def parse_date_any(dt_text: str):
+    """
+    Tenta RFC-2822 (pubDate) e ISO 8601/RFC-3339 (updated/published).
+    """
+    if not dt_text:
+        return None
+    s = dt_text.strip()
+    # 1) RFC-2822
     try:
-        # pubDate padrão RSS: "Sun, 24 Aug 2025 14:05:00 GMT"
-        dt = eut.parsedate_to_datetime(dt_text.strip())
-        return dt
+        return eut.parsedate_to_datetime(s)
+    except Exception:
+        pass
+    # 2) ISO 8601: 2025-08-24T19:10:00Z ou com offset
+    try:
+        if s.endswith("Z"):
+            s2 = s[:-1] + "+00:00"
+        else:
+            s2 = s
+        return datetime.fromisoformat(s2)
     except Exception:
         return None
+
+def is_recent_dt(dt_obj: datetime, now_utc: datetime, max_hours: int) -> bool:
+    if not isinstance(dt_obj, datetime):
+        return False
+    if dt_obj.tzinfo is None:  # assume UTC
+        dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+    delta = now_utc - dt_obj.astimezone(timezone.utc)
+    return timedelta(0) <= delta <= timedelta(hours=max_hours)
 
 
 # ================== EXTRAÇÃO ==================
@@ -165,7 +187,7 @@ def extract_from_article_url(url: str):
         content_html = clean_html(doc.summary(html_partial=True) or "")
 
         # fallback se curto
-        if len(extract_plain(content_html)) < 300:
+        if len(extract_plain(content_html)) < MIN_CHARS or count_paragraphs(content_html) < MIN_PARAGRAPHS:
             soup = BeautifulSoup(html, "lxml")
             art = soup.find("article")
             if art:
@@ -173,7 +195,7 @@ def extract_from_article_url(url: str):
                 if not title:
                     h = art.find(["h1", "h2"])
                     if h: title = h.get_text(strip=True)
-            if len(extract_plain(content_html)) < 300:
+            if len(extract_plain(content_html)) < MIN_CHARS or count_paragraphs(content_html) < MIN_PARAGRAPHS:
                 best, score = None, 0
                 for div in soup.find_all(["div", "main", "section"]):
                     pcount = len(div.find_all("p"))
@@ -207,7 +229,6 @@ def gnews_query_with_when(keyword: str) -> str:
     else:
         days = max(1, RECENT_HOURS // 24)
         when_token = f"when:{days}d"
-    # Monta a query "keyword when:XXh"
     q = f"{keyword} {when_token}"
     return f"https://news.google.com/rss/search?q={quote_plus(q)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
 
@@ -222,18 +243,24 @@ def pick_from_gnews(keyword: str):
         r = http_get(feed, timeout=TIMEOUT, accept="application/rss+xml,application/xml,text/xml,text/html")
         soup = BeautifulSoup(r.content, "xml")
         items = soup.find_all(["item", "entry"])
+
+        # Mapeia itens com data interpretada (para ordenar por recência)
+        parsed = []
         for it in items:
-            # Filtra por pubDate (recência)
-            pub = None
-            for tag in ["pubDate", "updated", "published"]:
+            dt = None
+            for tag in ("pubDate", "updated", "published"):
                 t = it.find(tag)
                 if t and t.text:
-                    pub = parse_rfc2822(t.text) if tag == "pubDate" else parse_rfc2822(t.text) or None
-                    # Muitas vezes updated/published não estão em RFC — se não der, ignora
-                    break
-            if pub and not is_recent(pub, now_utc, RECENT_HOURS):
-                # muito antigo para nossa janela — pula
-                continue
+                    dt = parse_date_any(t.text)
+                    if dt: break
+            parsed.append((it, dt))
+
+        # Ordena por data desc (itens sem data vão para o fim)
+        parsed.sort(key=lambda x: x[1] or datetime(1970,1,1,tzinfo=timezone.utc), reverse=True)
+
+        for it, dt in parsed[:12]:  # tenta nos top 12
+            if dt and not is_recent_dt(dt, now_utc, RECENT_HOURS):
+                continue  # antigo para nossa janela
 
             link = ""
             link_tag = it.find("link")
@@ -245,10 +272,10 @@ def pick_from_gnews(keyword: str):
             if not link:
                 continue
 
-            # resolve/link final e extrai
             title, html, img, final = extract_from_article_url(link)
-            if len(extract_plain(html)) >= 400:
+            if len(extract_plain(html)) >= MIN_CHARS and count_paragraphs(html) >= MIN_PARAGRAPHS:
                 return title, html, img, final
+
         return "", "", "", feed
     except Exception as e:
         log("[pick_from_gnews] erro:", e, "| kw=", keyword)
@@ -258,6 +285,7 @@ def pick_from_gnews(keyword: str):
 # ================== IA (TextSynth opcional) ==================
 def textsynth_rewrite(title: str, plain: str):
     if not TEXTSYNTH_KEY:
+        # sem IA: já devolve HTML mínimo
         return title, f"<p>{plain}</p>", ""
     prompt = f"""
 Você é um jornalista do Litoral Norte de SP. Reescreva jornalisticamente o texto abaixo em HTML limpo (apenas <p>, <h2>, <ul><li>, <strong>, <em>). 4-7 parágrafos. Sem publicidade nem 'leia também'. Gere meta descrição (160 caracteres) ao final.
@@ -288,39 +316,42 @@ TEXTO ORIGINAL:
 
 
 # ================== PIPELINE ==================
+def save_article(data: dict):
+    global LAST_ARTICLE
+    LAST_ARTICLE = data
+    with open(LAST_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
 def scrape_once():
     """
     Para cada KEYWORD:
       - consulta Google News RSS (com when:XXh)
-      - filtra por pubDate dentro de RECENT_HOURS
-      - extrai a primeira matéria válida
-      - reescreve (se TEXTSYNTH_KEY) e salva em /artigos/ultimo.json
+      - filtra por data recente (RFC-2822/ISO 8601)
+      - extrai, reescreve (se TEXTSYNTH_KEY)
+      - salva em /artigos/ultimo.json
     """
-    global LAST_ARTICLE
     if not KEYWORDS:
-        log("[JOB] Sem KEYWORDS definidas (configure a env KEYWORDS no Render).")
+        log("[JOB] Sem KEYWORDS definidas (env KEYWORDS).")
         return
 
     for kw in KEYWORDS:
         title, content_html, img, final = pick_from_gnews(kw)
         plain = extract_plain(content_html)
-        if len(plain) < 400:
-            log("[JOB] Conteúdo curto/antigo para kw:", kw)
+        if len(plain) < MIN_CHARS or count_paragraphs(content_html) < MIN_PARAGRAPHS:
+            log("[JOB] Conteúdo insuficiente (kw):", kw)
             continue
 
         new_title, rewritten_html, meta = textsynth_rewrite(title, plain)
-        if len(extract_plain(rewritten_html)) < 400:
-            # se IA não ajudar, usa o limpo
+        # Garantia mínima
+        if len(extract_plain(rewritten_html)) < MIN_CHARS:
             rewritten_html = f"<p>{plain}</p>"
 
         data = build_json(new_title or title, rewritten_html, img, final)
-        LAST_ARTICLE = data
-        with open(LAST_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        log("[JOB] ultimo.json atualizado com:", data["title"][:90], "| kw:", kw)
+        save_article(data)
+        log("[JOB] ultimo.json atualizado:", data["title"][:90], "| kw:", kw)
         return
 
-    log("[JOB] Nenhuma keyword recente retornou conteúdo suficiente.")
+    log("[JOB] Nenhuma keyword RECENTE com texto suficiente.")
 
 
 def scheduler_loop():
@@ -335,7 +366,7 @@ def scheduler_loop():
 # ================== ROTAS ==================
 @app.route("/")
 def idx():
-    return "AutoPost Render (keywords→GNews→RECENT_HOURS→ultimo.json) OK", 200
+    return "AutoPost (keywords→GNews→RECENT_HOURS→ultimo.json) OK", 200
 
 @app.route("/health")
 def health():
@@ -344,7 +375,9 @@ def health():
         "time": datetime.utcnow().isoformat(),
         "keywords": KEYWORDS,
         "interval": SCRAPE_INTERVAL,
-        "recent_hours": RECENT_HOURS
+        "recent_hours": RECENT_HOURS,
+        "min_chars": MIN_CHARS,
+        "min_paragraphs": MIN_PARAGRAPHS,
     })
 
 @app.route("/job/run")
@@ -363,6 +396,29 @@ def ultimo_json():
             return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify(LAST_ARTICLE or {"ok": False, "error": "vazio"}), 200
 
+# DEBUG: lista itens do GNews com data parseada
+@app.route("/gnews/<kw>")
+def dbg_gnews(kw):
+    feed = gnews_query_with_when(kw)
+    out = {"feed": feed, "items": []}
+    try:
+        r = http_get(feed, timeout=TIMEOUT, accept="application/rss+xml,application/xml,text/xml,text/html")
+        soup = BeautifulSoup(r.content, "xml")
+        for it in soup.find_all(["item", "entry"]):
+            title = (it.find("title").text.strip() if it.find("title") else "")
+            dt = None
+            for tag in ("pubDate", "updated", "published"):
+                t = it.find(tag)
+                if t and t.text:
+                    dt = parse_date_any(t.text); break
+            out["items"].append({
+                "title": title,
+                "date_raw": (it.find("pubDate").text if it.find("pubDate") else (it.find("updated").text if it.find("updated") else (it.find("published").text if it.find("published") else ""))),
+                "date_parsed_utc": dt.astimezone(timezone.utc).isoformat() if dt else None
+            })
+    except Exception as e:
+        out["error"] = str(e)
+    return jsonify(out)
 
 # ================== MAIN ==================
 if __name__ == "__main__":
