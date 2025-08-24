@@ -3,10 +3,6 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin, parse_qs
 
 TIMEOUT = int(os.getenv('TIMEOUT_SECONDS', '60'))
-# Espera **antes** de resolver links do Google News (simula “carregar a página”)
-GNEWS_WAIT_SECONDS = int(os.getenv('GNEWS_WAIT_SECONDS', '20'))
-# Tentativas de resolução do Google News
-GNEWS_MAX_TRIES = int(os.getenv('GNEWS_MAX_TRIES', '3'))
 
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/119 Safari/537.36'
 HDRS = {
@@ -15,7 +11,13 @@ HDRS = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
 }
 
-# ---------------- Google News helpers ----------------
+def is_gnews(url: str) -> bool:
+    try:
+        return 'news.google.' in urlparse(url).netloc.lower()
+    except Exception:
+        return False
+
+# ---------------- Feeds ----------------
 def google_news_rss_for(query: str, lang='pt-BR', country='BR'):
     import urllib.parse as up
     q = up.quote(query)
@@ -28,139 +30,69 @@ def get_feeds():
     kws = os.getenv('KEYWORDS', 'litoral norte de sao paulo; ilhabela; sao sebastiao; caraguatatuba; ubatuba')
     return [google_news_rss_for(k.strip()) for k in kws.split(';') if k.strip()]
 
-def _resolve_meta_refresh(html, base):
-    m = re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\']\s*\d+\s*;\s*url=([^"\']+)["\']', html, re.I)
-    if m:
-        url = m.group(1).strip()
-        return urljoin(base, url)
-    return ''
-
-def _first_external_link(html):
-    soup = BeautifulSoup(html, 'lxml')
-    for a in soup.find_all('a', href=True):
-        href = a['href'].strip()
-        if href.startswith('/'):
-            continue
-        pu = urlparse(href)
-        if not pu.scheme.startswith('http'):
-            continue
-        if 'news.google.' in pu.netloc:
-            continue
-        return href
-    return ''
-
-def _amp_link(html, base):
-    soup = BeautifulSoup(html, 'lxml')
-    tag = soup.find('link', rel=lambda v: v and 'amphtml' in v)
-    if tag and tag.get('href'):
-        return urljoin(base, tag['href'].strip())
-    return ''
-
-def _rel_canonical(html, base):
+# ---------------- Helpers de extração de URL real ----------------
+def _publisher_from_entry(e) -> str:
+    """
+    Tenta extrair o link DIRETO do veículo a partir do RSS do Google News.
+    1) <source url="...">
+    2) links[] com ?url=...
+    3) link com ?url=...
+    """
+    # 1) <source url="...">
     try:
-        soup = BeautifulSoup(html, 'lxml')
-        tag = soup.find('link', rel=lambda v: v and 'canonical' in v)
-        if tag and tag.get('href'):
-            return urljoin(base, tag['href'].strip())
+        # feedparser expõe e.source com .href
+        src = getattr(e, 'source', None)
+        if src:
+            href = getattr(src, 'href', None)
+            if not href and isinstance(src, dict):
+                href = src.get('href')
+            if href:
+                return href
     except Exception:
         pass
-    return ''
 
-def _og_url(html, base):
+    # 2) links[] com ?url=
     try:
-        soup = BeautifulSoup(html, 'lxml')
-        tag = soup.find('meta', property='og:url')
-        if tag and tag.get('content'):
-            return urljoin(base, tag['content'].strip())
+        links = getattr(e, 'links', []) or []
+        for L in links:
+            href = getattr(L, 'href', None) or (isinstance(L, dict) and L.get('href'))
+            if not href:
+                continue
+            q = parse_qs(urlparse(href).query)
+            if 'url' in q and q['url']:
+                return q['url'][0]
     except Exception:
         pass
+
+    # 3) link com ?url=
+    try:
+        href = e.get('link') or ''
+        q = parse_qs(urlparse(href).query)
+        if 'url' in q and q['url']:
+            return q['url'][0]
+    except Exception:
+        pass
+
+    # Se nada deu certo, retorna vazio (vamos usar o próprio link depois)
     return ''
 
-def is_gnews(url: str) -> bool:
-    try:
-        host = urlparse(url).netloc.lower()
-        return 'news.google.' in host
-    except Exception:
-        return False
-
-def resolve_google_news_once(url: str, timeout=TIMEOUT) -> str:
+def normalize_candidate_url(u: str, entry=None) -> str:
     """
-    Resolve uma vez: tenta query ?url=, meta refresh, canonical, og:url, amphtml, 1º link externo.
+    Se for Google News, tenta pegar o link do veículo direto do RSS (sem abrir a página do Google).
+    Caso não consiga, devolve o próprio u (último recurso).
     """
-    # 1) ?url= no query
-    q = parse_qs(urlparse(url).query)
-    if 'url' in q and q['url']:
-        resolved = q['url'][0]
-        print(f"[resolve_gnews] via query url= -> {resolved}", file=sys.stderr)
-        return resolved
-
-    try:
-        r = requests.get(url, headers=HDRS, timeout=timeout, allow_redirects=True)
-        r.raise_for_status()
-        html = r.text
-
-        u = _resolve_meta_refresh(html, r.url)
-        if u:
-            print(f"[resolve_gnews] via meta-refresh -> {u}", file=sys.stderr)
-            return u
-
-        u = _rel_canonical(html, r.url)
-        if u and 'news.google.' not in urlparse(u).netloc:
-            print(f"[resolve_gnews] via rel=canonical -> {u}", file=sys.stderr)
-            return u
-
-        u = _og_url(html, r.url)
-        if u and 'news.google.' not in urlparse(u).netloc:
-            print(f"[resolve_gnews] via og:url -> {u}", file=sys.stderr)
-            return u
-
-        u = _amp_link(html, r.url)
-        if u:
-            print(f"[resolve_gnews] via amphtml -> {u}", file=sys.stderr)
-            return u
-
-        u = _first_external_link(html)
-        if u:
-            print(f"[resolve_gnews] via first external link -> {u}", file=sys.stderr)
-            return u
-
-    except Exception as e:
-        print(f"[resolve_gnews] erro: {e}", file=sys.stderr)
-
-    print(f"[resolve_gnews] fallback -> {url}", file=sys.stderr)
-    return url
-
-def resolve_google_news(url: str, timeout=TIMEOUT) -> str:
-    """
-    Resolve link do Google News com espera inicial e retries.
-    - Espera GNEWS_WAIT_SECONDS (p/ sites que “demoram a abrir”).
-    - Tenta até GNEWS_MAX_TRIES vezes com pequeno backoff.
-    """
-    if not is_gnews(url):
-        return url
-
-    # Espera “abrir”
-    if GNEWS_WAIT_SECONDS > 0:
-        print(f"[resolve_gnews] waiting {GNEWS_WAIT_SECONDS}s before resolving", file=sys.stderr)
-        time.sleep(GNEWS_WAIT_SECONDS)
-
-    tries = max(1, GNEWS_MAX_TRIES)
-    last = url
-    for i in range(tries):
-        resolved = resolve_google_news_once(last, timeout=timeout)
-        if resolved and resolved != last and not is_gnews(resolved):
-            return resolved
-        # pequeno backoff e nova tentativa (pode ser que mude algo após alguns segundos)
-        time.sleep(min(5, max(1, int(GNEWS_WAIT_SECONDS/4))))  # 1–5s
-        last = resolved
-    return last
-
-def normalize_candidate_url(u: str) -> str:
+    if entry is not None:
+        pub = _publisher_from_entry(entry)
+        if pub:
+            return pub
+    # ainda tenta ?url= diretamente no u
     if is_gnews(u):
-        return resolve_google_news(u)
+        q = parse_qs(urlparse(u).query)
+        if 'url' in q and q['url']:
+            return q['url'][0]
     return u
 
-# ---------------- Conteúdo helpers ----------------
+# ---------------- Limpeza / reconstrução ----------------
 BAD_PREFIX = [
     'leia também','leia tambem','veja também','veja tambem','publicidade','anúncio','anuncio',
     'compartilhe','assine','siga-nos','saiba mais','link patrocinado','oferta',
@@ -197,7 +129,7 @@ def clean_noise_blocks(html: str) -> str:
 
 def pick_content_html(page_html: str) -> str:
     """
-    Extrai corpo a partir de article|main|divs comuns e reconstrói whitelist p/h2/li.
+    Extrai o corpo a partir de article|main|divs comuns e reconstrói whitelist p/h2/li.
     """
     if not page_html:
         return ''
@@ -261,23 +193,27 @@ def get_fresh_article_candidates(limit=10):
     try:
         for feed in feeds:
             fp = feedparser.parse(feed)
-            for e in fp.entries[:5]:
-                url = e.get('link') or ''
+            for e in fp.entries[:6]:
+                gnews_link = e.get('link') or ''
                 title = e.get('title') or ''
-                url = normalize_candidate_url(url)
-                items.append({'url': url, 'title': title})
+
+                # Prioriza link do veículo:
+                real = normalize_candidate_url(gnews_link, entry=e)
+                if not real:
+                    real = gnews_link
+
+                items.append({'url': real, 'title': title})
                 if len(items) >= limit:
                     return items
-    except Exception as e:
-        print(f"[candidates] erro: {e}", file=sys.stderr)
+    except Exception as ex:
+        print(f"[candidates] erro: {ex}", file=sys.stderr)
     return items
 
 def fetch_and_extract(url: str, timeout=TIMEOUT):
     """
-    Resolve Google News (com espera e retries) -> baixa página do veículo -> extrai corpo limpo.
-    Retorna sempre 'html' quando possível; 'text' pode vir curto em alguns sites.
+    Baixa a página do VEÍCULO e extrai corpo limpo (sem abrir Google News).
     """
-    real_url = normalize_candidate_url(url)
+    real_url = url  # já normalizado em get_fresh_article_candidates
 
     r = requests.get(real_url, headers=HDRS, timeout=timeout, allow_redirects=True)
     r.raise_for_status()
