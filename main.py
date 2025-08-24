@@ -1,306 +1,292 @@
-import os, re, time, json, html, logging, hashlib
-from datetime import datetime, timezone, timedelta
-from urllib.parse import quote_plus, urlparse
+import os, time, re, json, logging, html
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
+import tldextract
 import requests
 import feedparser
-from flask import Flask, jsonify
+from bs4 import BeautifulSoup
+from flask import Flask, jsonify, Response
 from apscheduler.schedulers.background import BackgroundScheduler
-from dateutil import parser as dtparser
-import trafilatura
 
-# ---------------------------
-# Config
-# ---------------------------
-PORT = int(os.environ.get("PORT", "10000"))
-CRON_MINUTES = int(os.environ.get("CRON_MINUTES", "5"))
-RESOLVE_WAIT_SECONDS = int(os.environ.get("RESOLVE_WAIT_SECONDS", "3"))  # tempo de “espera” entre chamadas
-RECENCY_HOURS = int(os.environ.get("RECENCY_HOURS", "6"))  # só pega notícia recente
-KEYWORDS = [k.strip() for k in os.environ.get("KEYWORDS", "").split(",") if k.strip()]
-FEEDS = [f.strip() for f in os.environ.get("FEEDS", "").split(",") if f.strip()]
-MIN_CHARS = int(os.environ.get("MIN_CHARS", "350"))
-MIN_P_COUNT = int(os.environ.get("MIN_P_COUNT", "2"))
-UA = os.environ.get("UA", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+# -------------------------
+# Config via ENV
+# -------------------------
+KEYWORDS = [k.strip() for k in os.getenv("KEYWORDS", "litoral norte de sao paulo, ilhabela, sao sebastiao, caraguatatuba, ubatuba, brasil, futebol, formula 1, f1").split(",") if k.strip()]
+RECENCY_HOURS = int(os.getenv("RECENCY_HOURS", "6"))
+CRON_MINUTES = int(os.getenv("CRON_MINUTES", "5"))
+RESOLVE_WAIT_SECONDS = int(os.getenv("RESOLVE_WAIT_SECONDS", "3"))
+MIN_CHARS = int(os.getenv("MIN_CHARS", "300"))
+MIN_P_COUNT = int(os.getenv("MIN_P_COUNT", "2"))
 
-# cidade/termos locais para tags
-LOCAL_CITIES = ["caraguatatuba","são sebastião","sao sebastiao","ilhabela","ubatuba","litoral norte","litoral norte de são paulo"]
+# headers para evitar 403/anti-bot simples
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("main")
 
 app = Flask(__name__)
-scheduler = BackgroundScheduler(timezone="UTC")
+scheduler = BackgroundScheduler()
+last_article = {}  # memória do último artigo válido
 
-STATE = {
-    "last_item": None,   # dict pronto pro WP
-    "last_raw": None,    # debug
-    "last_run": None
-}
+# -------------------------
+# Utilidades
+# -------------------------
+def now_utc():
+    return datetime.now(timezone.utc)
 
-# ---------------------------
-# Utils
-# ---------------------------
-def http_get(url, allow_redirects=True, timeout=25):
-    headers = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
-    r = requests.get(url, headers=headers, allow_redirects=allow_redirects, timeout=timeout)
-    r.raise_for_status()
-    return r
+def within_recency(dt):
+    return dt and (now_utc() - dt <= timedelta(hours=RECENCY_HOURS))
 
-def is_recent(dt: datetime) -> bool:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - dt) <= timedelta(hours=RECENCY_HOURS)
-
-def normspace(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
-
-def domain_name(u: str) -> str:
+def parse_pubdate(entry):
     try:
-        return urlparse(u).netloc.replace("www.","")
-    except:
-        return "fonte"
-
-def summarize_sentences(text: str, n=2) -> str:
-    # corte muito simples para lide/meta
-    parts = re.split(r"(?<=[\.\!\?])\s+", text.strip())
-    return " ".join(parts[:n]).strip()
-
-def build_tags(title: str, body: str, base_keywords):
-    t = (title + " " + body).lower()
-    tags = set()
-    for kw in base_keywords:
-        if kw.lower() in t:
-            tags.add(kw.lower())
-    for city in LOCAL_CITIES:
-        if city in t:
-            tags.add(city)
-    # complementa com termos gerais
-    for extra in ["brasil","mundo","governo","polícia","esporte","economia","tempo","trânsito"]:
-        if extra in t:
-            tags.add(extra)
-    # limita 10 tags
-    return list(tags)[:10] if tags else list(set((base_keywords or [])[:10]))
-
-def render_markdown(title, corpo, fonte_nome, meta_desc, tags_list):
-    # Estrutura exigida
-    md = []
-    md.append(f"### {title}")
-    md.append("")
-    for p in corpo:
-        md.append(normspace(p))
-        md.append("")
-    md.append(f"Fonte: {fonte_nome}")
-    md.append("")
-    md.append("---")
-    md.append("")
-    md.append(f"**Meta descrição:** {meta_desc}")
-    md.append("")
-    md.append("---")
-    md.append("")
-    md.append("**Tags:** " + ", ".join(tags_list))
-    return "\n".join(md).strip()
-
-def rewrite_to_portal_style(title, text, src_name):
-    # Reescrita simples e objetiva (sem IA externa), 4–5 parágrafos.
-    text = normspace(text)
-    if len(text) < 200:
-        return None
-
-    lide = summarize_sentences(text, 2)
-    resto = text[len(lide):].strip()
-    # divide em 3 blocos
-    chunks = re.split(r"(?<=[\.\!\?])\s+", resto)
-    p2 = " ".join(chunks[:3]).strip()
-    p3 = " ".join(chunks[3:7]).strip()
-    p4 = " ".join(chunks[7:11]).strip()
-
-    corpo = [lide]
-    for p in [p2, p3, p4]:
-        if p:
-            corpo.append(p)
-    if len(corpo) < 4:
-        # força ao menos 4 parágrafos: duplica partes se necessário
-        while len(corpo) < 4 and text:
-            corpo.append(summarize_sentences(resto, 1))
-
-    meta = summarize_sentences(text, 1)
-    meta = meta[:158]  # margem pro "…"
-    return corpo, meta
-
-# ---------------------------
-# Google News Search (RSS)
-# ---------------------------
-def gnews_search_urls(keywords):
-    urls = []
-    for kw in keywords:
-        q = quote_plus(kw)
-        # feed de busca
-        u = f"https://news.google.com/rss/search?q={q}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
-        urls.append(u)
-    return urls
-
-def pick_items_from_feed(feed_url):
-    d = feedparser.parse(feed_url)
-    items = []
-    for e in d.entries:
-        link = e.get("link") or ""
-        title = html.unescape(e.get("title") or "").strip()
-        pub = e.get("published") or e.get("pubDate") or e.get("updated") or ""
-        try:
-            published = dtparser.parse(pub) if pub else datetime.now(timezone.utc)
-        except:
-            published = datetime.now(timezone.utc)
-        items.append({
-            "title": title,
-            "link": link,
-            "published": published if isinstance(published, datetime) else datetime.now(timezone.utc),
-            "source": e.get("source", {}).get("title") if isinstance(e.get("source"), dict) else None
-        })
-    return items
-
-def resolve_news_google(link):
-    """Resolve link do news.google para URL final do publisher."""
-    try:
-        time.sleep(max(0, RESOLVE_WAIT_SECONDS))
-        r = http_get(link, allow_redirects=True, timeout=25)
-        # Após redirecionar, use URL final
-        return r.url
-    except Exception as ex:
-        log.warning("[RESOLVE] falhou resolver %s: %s", link, ex)
-        return link  # tenta mesmo assim
-
-def extract_text(url):
-    try:
-        r = http_get(url, allow_redirects=True, timeout=30)
-        downloaded = trafilatura.extract(r.text, favor_recall=True, include_links=False)
-        if not downloaded:
-            return None
-        txt = normspace(downloaded)
-        # exige um mínimo pra evitar notas curtas
-        if len(txt) < MIN_CHARS or txt.count(".") < MIN_P_COUNT:
-            return None
-        return txt
-    except Exception as ex:
-        log.warning("[EXTRACT] erro %s: %s", url, ex)
-        return None
-
-# ---------------------------
-# Job principal
-# ---------------------------
-def job_run():
-    try:
-        STATE["last_run"] = datetime.now(timezone.utc).isoformat()
-        base_feeds = FEEDS[:] if FEEDS else gnews_search_urls(KEYWORDS or ["Litoral Norte SP"])
-        log.info("[JOB] Feeds = %d | KW = %s", len(base_feeds), "; ".join(KEYWORDS) if KEYWORDS else "(padrão)")
-        candidates = []
-
-        for f in base_feeds:
-            try:
-                items = pick_items_from_feed(f)
-                for it in items:
-                    if not is_recent(it["published"]):
-                        continue
-                    # se KEYWORDS definidas, filtra pelo título
-                    if KEYWORDS:
-                        lowt = (it["title"] or "").lower()
-                        if not any(kw.lower() in lowt for kw in KEYWORDS):
-                            continue
-                    # resolve link se for do news.google
-                    final_url = resolve_news_google(it["link"]) if "news.google.com" in it["link"] else it["link"]
-                    candidates.append({
-                        "title": it["title"],
-                        "url": final_url,
-                        "published": it["published"],
-                        "src": it.get("source") or domain_name(final_url)
-                    })
-            except Exception as ex:
-                log.warning("[JOB] feed erro %s: %s", f, ex)
-
-        # ordena por mais recente
-        candidates.sort(key=lambda x: x["published"], reverse=True)
-
-        # tenta extrair o primeiro que tiver conteúdo suficiente
-        for c in candidates[:25]:
-            txt = extract_text(c["url"])
-            if not txt:
-                continue
-
-            # reescrever no padrão do portal
-            rew = rewrite_to_portal_style(c["title"], txt, c["src"])
-            if not rew:
-                continue
-
-            corpo, meta = rew
-            tags = build_tags(c["title"], " ".join(corpo), KEYWORDS)
-            titulo_ok = c["title"]
-            fonte_nome = c["src"] or domain_name(c["url"])
-            md = render_markdown(titulo_ok, corpo, fonte_nome, meta, tags)
-
-            payload = {
-                "ok": True,
-                "source_url": c["url"],
-                "source_domain": domain_name(c["url"]),
-                "source_title": c["title"],
-                "published_at": c["published"].isoformat(),
-                "title": titulo_ok,
-                "tags": tags,
-                "render_markdown": md
-            }
-            STATE["last_item"] = payload
-            STATE["last_raw"] = {"title": c["title"], "url": c["url"], "text_len": len(txt)}
-            log.info("[OK] %s | %s", titulo_ok, c["url"])
-            return
-
-        log.warning("[JOB] Nenhum item com conteúdo suficiente.")
-        STATE["last_item"] = {"ok": False, "reason": "no_content"}
-    except Exception as ex:
-        log.exception("[JOB] ERRO: %s", ex)
-        STATE["last_item"] = {"ok": False, "reason": "exception"}
-
-# ---------------------------
-# HTTP
-# ---------------------------
-@app.get("/")
-def root():
-    return "OK - Autopost server"
-
-@app.get("/health")
-def health():
-    return jsonify({"ok": True, "last_run": STATE["last_run"]})
-
-@app.get("/debug/config")
-def debug_config():
-    cfg = {
-        "PORT": PORT,
-        "CRON_MINUTES": CRON_MINUTES,
-        "RESOLVE_WAIT_SECONDS": RESOLVE_WAIT_SECONDS,
-        "RECENCY_HOURS": RECENCY_HOURS,
-        "KEYWORDS": KEYWORDS,
-        "FEEDS": FEEDS,
-        "MIN_CHARS": MIN_CHARS,
-        "MIN_P_COUNT": MIN_P_COUNT
-    }
-    return jsonify(cfg)
-
-@app.get("/debug/run")
-def debug_run():
-    job_run()
-    return jsonify({"ok": True, "last": STATE["last_item"], "raw": STATE["last_raw"]})
-
-@app.get("/artigos/ultimo.json")
-def ultimo_json():
-    item = STATE["last_item"]
-    return jsonify(item if item else {"ok": False, "reason": "no_run_yet"})
-
-# ---------------------------
-# Main
-# ---------------------------
-if __name__ == "__main__":
-    scheduler.add_job(job_run, "interval", minutes=CRON_MINUTES, id="job_run", replace_existing=True)
-    scheduler.start()
-    # roda 1x no boot para já ter algo
-    try:
-        job_run()
+        if getattr(entry, "published_parsed", None):
+            return datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
     except Exception:
         pass
-    app.run(host="0.0.0.0", port=PORT)
+    return None
+
+def domain_name(url):
+    try:
+        ext = tldextract.extract(url)
+        root = ".".join(p for p in [ext.domain, ext.suffix] if p)
+        return root or urlparse(url).netloc
+    except Exception:
+        return urlparse(url).netloc
+
+def clean_text(txt):
+    txt = html.unescape(txt or "")
+    txt = re.sub(r"\s+\n", "\n", txt)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    txt = re.sub(r"\s{2,}", " ", txt)
+    return txt.strip()
+
+def summarize_to_paragraphs(text, min_par=4, max_par=5):
+    # Divide por quebras de linha ou pontos grandes; faz blocos curtos
+    parts = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    if not parts:
+        # fallback por frases
+        sentences = re.split(r"(?<=[\.\!\?])\s+", text)
+        parts = []
+        buf = []
+        for s in sentences:
+            buf.append(s)
+            if len(" ".join(buf)) >= 400:
+                parts.append(" ".join(buf).strip())
+                buf = []
+        if buf:
+            parts.append(" ".join(buf).strip())
+    # limita 4–5 parágrafos
+    if len(parts) < min_par:
+        # quebra artificial em ~350 chars
+        chunk = 350
+        blocks = [text[i:i+chunk].strip() for i in range(0, len(text), chunk)]
+        parts = [b for b in blocks if len(b) > 80]
+    parts = parts[:max_par] if len(parts) > max_par else parts
+    if len(parts) >= 1:
+        # lide mais direto (primeiro parágrafo)
+        parts[0] = re.sub(r"^\W+", "", parts[0])
+    return parts[:max_par]
+
+# -------------------------
+# Extração de HTML
+# -------------------------
+def extract_main(url, timeout=20):
+    r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+    r.raise_for_status()
+    html_doc = r.text
+    soup = BeautifulSoup(html_doc, "lxml")
+
+    # remove elementos óbvios
+    for tag in soup(["script", "style", "noscript", "iframe"]):
+        tag.decompose()
+    for sel in ["header", "footer", "nav", ".share", ".social", ".breadcrumbs", ".advertisement", ".ads"]:
+        for t in soup.select(sel):
+            t.decompose()
+
+    # título
+    title = ""
+    mt = soup.find("meta", property="og:title")
+    if mt and mt.get("content"):
+        title = mt["content"].strip()
+    if not title and soup.title:
+        title = soup.title.get_text(strip=True)
+
+    # imagem
+    img = None
+    for key in ["og:image", "twitter:image", "image"]:
+        m = soup.find("meta", property=key) or soup.find("meta", attrs={"name": key})
+        if m and m.get("content"):
+            img = m["content"].strip()
+            break
+
+    # conteúdo — prioriza <article>, depois main, depois divs grandes com <p>
+    container = soup.find("article") or soup.find("main")
+    if not container:
+        candidates = sorted(soup.find_all(["div", "section"]), key=lambda x: len(x.get_text(" ", strip=True)), reverse=True)
+        container = candidates[0] if candidates else soup.body
+
+    paragraphs = []
+    for p in container.find_all("p"):
+        t = p.get_text(" ", strip=True)
+        if t and len(t) > 40:
+            paragraphs.append(t)
+
+    text = "\n\n".join(paragraphs)
+    text = clean_text(text)
+
+    # contagem mínima
+    pcount = len([p for p in text.split("\n") if p.strip()])
+    if len(text) < MIN_CHARS or pcount < MIN_P_COUNT:
+        raise ValueError("conteudo_insuficiente")
+
+    return {
+        "title": clean_text(title) if title else "",
+        "text": text,
+        "image": img,
+    }
+
+# -------------------------
+# Montagem no padrão pedido
+# -------------------------
+LOCAL_CITIES = ["Caraguatatuba", "São Sebastião", "Ilhabela", "Ubatuba", "Litoral Norte"]
+def build_article(url, raw):
+    title = raw["title"] or ""
+    txt = raw["text"]
+
+    # gera 4–5 parágrafos
+    paras = summarize_to_paragraphs(txt, 4, 5)
+    body = "\n\n".join(paras)
+
+    # fonte
+    fonte = domain_name(url)
+    fonte_fmt = fonte.replace("www.", "").split("/")[0]
+
+    # meta descrição (até 160 chars)
+    md = clean_text(paras[0]) if paras else clean_text(title)
+    meta = (md[:157] + "…") if len(md) > 160 else md
+
+    # tags (auto): keywords + cidades detectadas + domínio
+    tags = set([k.lower() for k in KEYWORDS])
+    detect = [c for c in LOCAL_CITIES if re.search(rf"\b{re.escape(c)}\b", txt, flags=re.I)]
+    for c in detect:
+        tags.add(c.lower())
+    tags.add(fonte_fmt.lower())
+    tag_line = ", ".join(sorted(tags))[:500]
+
+    estrutura = {
+        "titulo": title.strip() or "(sem título)",
+        "corpo": body.strip(),
+        "fonte": fonte_fmt,
+        "meta_descricao": meta,
+        "tags": tag_line,
+        "imagem": raw.get("image"),
+        "url_origem": url,
+        "gerado_em": now_utc().isoformat()
+    }
+    return estrutura
+
+# -------------------------
+# Buscador Google News
+# -------------------------
+def gnews_search(keyword):
+    # Usa “q=keyword” no Google News RSS em PT-BR
+    q = requests.utils.quote(keyword)
+    url = f"https://news.google.com/rss/search?q={q}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+    return feedparser.parse(url)
+
+def resolve_gnews_link(link):
+    # Espera curto se necessário (sites que sobem devagar)
+    if RESOLVE_WAIT_SECONDS > 0:
+        log.info(f"[GNEWS] aguardando {RESOLVE_WAIT_SECONDS}s: {link}")
+        time.sleep(RESOLVE_WAIT_SECONDS)
+    # Segue redirects do próprio link do Google News
+    try:
+        r = requests.get(link, headers=HEADERS, timeout=20, allow_redirects=True)
+        r.raise_for_status()
+        return r.url
+    except Exception:
+        return link  # fallback: deixa como está
+
+# -------------------------
+# JOB principal
+# -------------------------
+def job_run():
+    global last_article
+    log.info("[JOB] start")
+    newest = None
+    newest_dt = None
+    newest_kw = None
+
+    for kw in KEYWORDS:
+        feed = gnews_search(kw)
+        for entry in feed.entries[:12]:  # pega poucos por keyword
+            pub = parse_pubdate(entry)
+            if not within_recency(pub):
+                continue
+            link = entry.link
+            real_url = resolve_gnews_link(link)
+
+            try:
+                raw = extract_main(real_url, timeout=20)
+            except ValueError:
+                log.warning(f"[JOB] Conteúdo insuficiente (kw: {kw}) em {real_url}")
+                continue
+            except Exception as e:
+                log.warning(f"[JOB] Falha ao extrair (kw: {kw}) {real_url}: {e}")
+                continue
+
+            # escolhe o mais novo
+            if newest is None or (pub and pub > newest_dt):
+                newest = build_article(real_url, raw)
+                newest_dt = pub
+                newest_kw = kw
+
+    if newest:
+        last_article = newest
+        log.info(f"[JOB] OK: {newest.get('titulo')} (kw: {newest_kw})")
+    else:
+        log.warning("[JOB] Nenhuma keyword RECENTE com texto suficiente.")
+
+# -------------------------
+# Flask endpoints
+# -------------------------
+@app.route("/")
+def home():
+    return Response("OK – RS Autoposter Bridge (v3)", mimetype="text/plain")
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "time": now_utc().isoformat(), "keywords": KEYWORDS})
+
+@app.route("/debug/run")
+def debug_run():
+    job_run()
+    return jsonify({"ok": True, "has_article": bool(last_article)})
+
+@app.route("/artigos/ultimo.json")
+def ultimo_json():
+    if not last_article:
+        return jsonify({"ok": False, "msg": "sem_artigo"}), 200
+    # Formato simples para plugin WP
+    return jsonify({
+        "ok": True,
+        "artigo": last_article
+    })
+
+# -------------------------
+# Boot
+# -------------------------
+if __name__ == "__main__":
+    # scheduler
+    scheduler.add_job(job_run, "interval", minutes=CRON_MINUTES, next_run_time=now_utc())
+    scheduler.start()
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+else:
+    # quando rodar via gunicorn no Render
+    scheduler.add_job(job_run, "interval", minutes=CRON_MINUTES, next_run_time=now_utc())
+    scheduler.start()
