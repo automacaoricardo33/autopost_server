@@ -1,19 +1,23 @@
 import os, time, json, threading, re
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urljoin
+from urllib.parse import quote_plus
 import requests
 from bs4 import BeautifulSoup
 from readability import Document
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 
 # ================== CONFIG ==================
 PORT = int(os.environ.get("PORT", "10000"))
 
-# IA opcional para reescrita
+# Palavras‑chave separadas por vírgula
+# Ex.: "caraguatatuba, ilhabela, são sebastião, trânsito, futebol, fórmula 1"
+KEYWORDS = [k.strip() for k in os.environ.get("KEYWORDS", "").split(",") if k.strip()]
+
+# IA opcional (TextSynth). Se vazio, publica texto limpo.
 TEXTSYNTH_KEY = os.environ.get("TEXTSYNTH_KEY", "")
 
-# Agendamento
-SCRAPE_INTERVAL = int(os.environ.get("SCRAPE_INTERVAL", "300"))  # 5min
+# Agendador
+SCRAPE_INTERVAL = int(os.environ.get("SCRAPE_INTERVAL", "300"))  # 5min default
 WAIT_GNEWS = int(os.environ.get("WAIT_GNEWS", "20"))             # espera para news.google.com
 TIMEOUT = int(os.environ.get("TIMEOUT", "30"))
 
@@ -39,21 +43,9 @@ BASE_HEADERS = {
     "Referer": "https://www.google.com/",
 }
 
-# Heurísticas para achar links de matérias em homepages
-GOOD_PATH_HINTS = [
-    "/noticia", "/notícias", "/news", "/politica", "/esportes", "/mundo",
-    "/cidade", "/brasil", "/economia", "/blog/", "/2025", "/2024", "/2023"
-]
-BAD_PATH_HINTS = [
-    "/video", "/videos", "/login", "/cadastro", "/assinante", "/tag/", "/tags/",
-    "/autor/", "/colun", "/podcast", "javascript:", "#", "/sobre", "/contato"
-]
-MAX_HOME_LINKS = 30   # quantos links candidatas testar por homepage
-
 # ================== APP/ESTADO ==================
 app = Flask(__name__)
 
-SOURCES = []               # lista de URLs (RSS, homepage ou notícia)
 LAST_ARTICLE = {}          # cache em memória do ultimo.json
 DATA_DIR = "/tmp/autopost-data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -71,47 +63,9 @@ def http_get(url, timeout=TIMEOUT, allow_redirects=True, accept=None):
     r.raise_for_status()
     return r
 
-def normalize_url(base, href):
-    if not href: return ""
-    href = href.strip()
-    if href.startswith("//"):
-        parsed = urlparse(base)
-        href = f"{parsed.scheme}:{href}"
-    if href.startswith("http://") or href.startswith("https://"):
-        return href
-    return urljoin(base, href)
-
-def same_domain(a, b):
-    pa, pb = urlparse(a), urlparse(b)
-    return (pa.netloc.lower() == pb.netloc.lower()) and pa.netloc != ""
-
-def is_rss_url(url: str) -> bool:
-    u = url.lower()
-    return u.endswith(".xml") or "/rss" in u or "/feed" in u or "format=xml" in u or "rss.xml" in u
-
-def is_homepage(url: str) -> bool:
-    p = urlparse(url)
-    path = (p.path or "").strip("/")
-    # homepage se caminho vazio ou curtíssimo
-    return path == "" or path.count("/") <= 0
-
-def looks_like_article(url: str) -> bool:
-    u = url.lower()
-    if any(bad in u for bad in BAD_PATH_HINTS):
-        return False
-    return any(h in u for h in GOOD_PATH_HINTS) or u.endswith(".html")
-
-def resolve_google_news(url: str) -> str:
-    if "news.google.com" not in url:
-        return url
-    log("[GNEWS] aguardando", WAIT_GNEWS, "s para resolver:", url)
-    time.sleep(WAIT_GNEWS)
-    try:
-        r = http_get(url, allow_redirects=True)
-        return r.url
-    except Exception as e:
-        log("[GNEWS] fallback sem resolver:", e)
-        return url
+def extract_plain(html: str) -> str:
+    soup = BeautifulSoup(html or "", "lxml")
+    return soup.get_text(" ", strip=True)
 
 def clean_html(html: str) -> str:
     if not html:
@@ -127,9 +81,17 @@ def clean_html(html: str) -> str:
     html = re.sub(r"(\s*\n\s*){3,}", "\n\n", html)
     return html
 
-def extract_plain(html: str) -> str:
-    soup = BeautifulSoup(html or "", "lxml")
-    return soup.get_text(" ", strip=True)
+def resolve_google_news(url: str) -> str:
+    if "news.google.com" not in url:
+        return url
+    log("[GNEWS] aguardando", WAIT_GNEWS, "s para resolver:", url)
+    time.sleep(WAIT_GNEWS)
+    try:
+        r = http_get(url, allow_redirects=True)
+        return r.url
+    except Exception as e:
+        log("[GNEWS] fallback sem resolver:", e)
+        return url
 
 def guess_category(text: str) -> int:
     t = (text or "").lower()
@@ -166,6 +128,7 @@ def build_json(title: str, html: str, img: str, source: str):
         "source": (source or "").strip(),
         "generated_at": datetime.now(timezone.utc).isoformat()
     }
+
 
 # ================== EXTRAÇÃO ==================
 def extract_from_article_url(url: str):
@@ -219,58 +182,36 @@ def extract_from_article_url(url: str):
         log("[extract_from_article_url] erro:", e, "| url=", url)
         return "", "", "", url
 
-def collect_article_links_from_home(home_url: str):
+def pick_from_gnews(keyword: str):
     """
-    Lê a homepage e tenta descobrir links de matérias do mesmo domínio.
-    Retorna lista de URLs (no máximo MAX_HOME_LINKS)
-    """
-    try:
-        r = http_get(home_url, timeout=TIMEOUT)
-        soup = BeautifulSoup(r.text, "lxml")
-        links = []
-        seen = set()
-        for a in soup.find_all("a", href=True):
-            href = normalize_url(home_url, a["href"])
-            if not href: continue
-            if href in seen: continue
-            seen.add(href)
-            if not same_domain(home_url, href): continue
-            if any(bad in href.lower() for bad in BAD_PATH_HINTS): continue
-            if looks_like_article(href):
-                links.append(href)
-            if len(links) >= MAX_HOME_LINKS:
-                break
-        return links
-    except Exception as e:
-        log("[collect_article_links_from_home] erro:", e, "| home=", home_url)
-        return []
-
-def extract_from_rss_url(rss_url: str):
-    """
-    Lê feed RSS e tenta a primeira matéria válida.
+    Usa Google News RSS para a keyword e tenta pegar a 1ª matéria válida.
     Retorna (title, content_html, image_url, final_url)
     """
+    feed = f"https://news.google.com/rss/search?q={quote_plus(keyword)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
     try:
-        r = http_get(rss_url, timeout=TIMEOUT, accept="application/rss+xml,application/xml,text/xml,text/html")
+        r = http_get(feed, timeout=TIMEOUT, accept="application/rss+xml,application/xml,text/xml,text/html")
         soup = BeautifulSoup(r.content, "xml")
         items = soup.find_all(["item", "entry"])
         for it in items:
             link = ""
+            # link pode vir em <link> ou no <guid>
             link_tag = it.find("link")
             if link_tag:
                 link = link_tag.get("href") or (link_tag.text or "").strip()
             if not link:
                 guid = it.find("guid")
                 if guid and guid.text: link = guid.text.strip()
-            if not link: continue
+            if not link:
+                continue
 
+            # resolve/link final e extrai
             title, html, img, final = extract_from_article_url(link)
             if len(extract_plain(html)) >= 400:
                 return title, html, img, final
-        return "", "", "", rss_url
+        return "", "", "", feed
     except Exception as e:
-        log("[extract_from_rss_url] erro:", e, "| rss=", rss_url)
-        return "", "", "", rss_url
+        log("[pick_from_gnews] erro:", e, "| kw=", keyword)
+        return "", "", "", feed
 
 
 # ================== IA (TextSynth opcional) ==================
@@ -306,59 +247,39 @@ TEXTO ORIGINAL:
 
 
 # ================== PIPELINE ==================
-def extract_one(url: str):
-    """
-    Decide como tratar a URL: RSS, homepage ou artigo.
-    Retorna dicionário JSON pronto (ou None)
-    """
-    url = url.strip()
-    if not url: return None
-
-    if is_rss_url(url):
-        title, content_html, img, final = extract_from_rss_url(url)
-    elif is_homepage(url):
-        # caça links de matéria na homepage
-        for cand in collect_article_links_from_home(url):
-            t, h, img, fin = extract_from_article_url(cand)
-            if len(extract_plain(h)) >= 400:
-                title, content_html, final = t, h, fin
-                break
-        else:
-            return None
-    else:
-        title, content_html, img, final = extract_from_article_url(url)
-
-    plain = extract_plain(content_html)
-    if len(plain) < 400:
-        return None
-
-    new_title, rewritten_html, meta = textsynth_rewrite(title, plain)
-    if len(extract_plain(rewritten_html)) < 400:
-        # usa o limpo se reescrita ficou curta
-        rewritten_html = f"<p>{plain}</p>"
-
-    data = build_json(new_title or title, rewritten_html, img, final)
-    return data
-
 def scrape_once():
     """
-    Percorre SOURCES; para cada uma, tenta extrair 1 matéria e salvar ultimo.json
+    Para cada KEYWORD:
+      - consulta Google News RSS
+      - extrai a primeira matéria válida
+      - reescreve (se TEXTSYNTH_KEY), salva em /artigos/ultimo.json
+    Para o WordPress basta ler /artigos/ultimo.json
     """
     global LAST_ARTICLE
-    if not SOURCES:
-        log("[JOB] Sem fontes configuradas.")
+    if not KEYWORDS:
+        log("[JOB] Sem KEYWORDS definidas (configure a env KEYWORDS no Render).")
         return
 
-    for src in list(SOURCES):
-        data = extract_one(src)
-        if data:
-            LAST_ARTICLE = data
-            with open(LAST_PATH, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False)
-            log("[JOB] Artigo atualizado em ultimo.json:", data["title"][:90])
-            return
+    for kw in KEYWORDS:
+        title, content_html, img, final = pick_from_gnews(kw)
+        plain = extract_plain(content_html)
+        if len(plain) < 400:
+            log("[JOB] Conteúdo curto para kw:", kw)
+            continue
 
-    log("[JOB] Nenhuma fonte retornou conteúdo suficiente.")
+        new_title, rewritten_html, meta = textsynth_rewrite(title, plain)
+        if len(extract_plain(rewritten_html)) < 400:
+            # se IA não ajudar, usa o limpo
+            rewritten_html = f"<p>{plain}</p>"
+
+        data = build_json(new_title or title, rewritten_html, img, final)
+        LAST_ARTICLE = data
+        with open(LAST_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        log("[JOB] ultimo.json atualizado com:", data["title"][:90], "| kw:", kw)
+        return
+
+    log("[JOB] Nenhuma keyword retornou conteúdo suficiente.")
 
 def scheduler_loop():
     while True:
@@ -372,91 +293,21 @@ def scheduler_loop():
 # ================== ROTAS ==================
 @app.route("/")
 def idx():
-    return "AutoPost Render Server OK", 200
+    return "AutoPost Render (keywords→GNews→ultimo.json) OK", 200
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "time": datetime.utcnow().isoformat(), "sources": len(SOURCES)})
-
-@app.route("/sources", methods=["GET"])
-def get_sources():
-    return jsonify({"sources": SOURCES})
-
-@app.route("/sources/update", methods=["POST"])
-def set_sources():
-    """
-    JSON:
-    {
-      "sources": ["https://site.com/", "https://site.com/feed", "https://site.com/noticia/123.html"],
-      "replace": true
-    }
-    """
-    try:
-        payload = request.get_json(force=True, silent=True) or {}
-        sources = payload.get("sources") or []
-        replace = bool(payload.get("replace", True))
-        urls = []
-        for s in sources:
-            s = str(s).strip()
-            if s: urls.append(s)
-        global SOURCES
-        if replace:
-            SOURCES = urls
-        else:
-            seen = set(SOURCES)
-            for u in urls:
-                if u not in seen:
-                    SOURCES.append(u)
-                    seen.add(u)
-        return jsonify({"ok": True, "count": len(SOURCES), "sources": SOURCES})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
+    return jsonify({
+        "ok": True,
+        "time": datetime.utcnow().isoformat(),
+        "keywords": KEYWORDS,
+        "interval": SCRAPE_INTERVAL
+    })
 
 @app.route("/job/run")
 def job_run():
     scrape_once()
     return jsonify({"ok": True})
-
-@app.route("/extract", methods=["POST"])
-def extract_endpoint():
-    """
-    JSON: {"url": "https://site.com/qualquer-coisa"}
-    - pode ser homepage, RSS ou link de notícia
-    - retorna o JSON da matéria (não salva)
-    """
-    try:
-        payload = request.get_json(force=True, silent=True) or {}
-        url = (payload.get("url") or "").strip()
-        if not url:
-            return jsonify({"ok": False, "error": "url vazia"}), 400
-        data = extract_one(url)
-        if not data:
-            return jsonify({"ok": False, "error": "nenhum conteúdo suficiente"}), 404
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/extract_and_save", methods=["POST"])
-def extract_and_save():
-    """
-    JSON: {"url": "https://site.com/qualquer-coisa"}
-    - faz a extração e SALVA em /artigos/ultimo.json
-    """
-    try:
-        payload = request.get_json(force=True, silent=True) or {}
-        url = (payload.get("url") or "").strip()
-        if not url:
-            return jsonify({"ok": False, "error": "url vazia"}), 400
-        data = extract_one(url)
-        if not data:
-            return jsonify({"ok": False, "error": "nenhum conteúdo suficiente"}), 404
-        global LAST_ARTICLE
-        LAST_ARTICLE = data
-        with open(LAST_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        return jsonify({"ok": True, "saved": True, "title": data.get("title","")})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/artigos/ultimo.json")
 def ultimo_json():
