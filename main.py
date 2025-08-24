@@ -1,57 +1,61 @@
-# main.py
-import os
 import logging
-from typing import List, Dict
-from datetime import datetime
-
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.executors.pool import ThreadPoolExecutor
-from apscheduler.jobstores.memory import MemoryJobStore
+from datetime import datetime, timezone
+from scraper import fetch_rss
 
-from scraper import fetch_latest_gnews
-
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("main")
+logging.basicConfig(level=logging.INFO)
 
-# Compartilhado com o server.py
-LATEST: Dict[str, dict] = {}
-KEYWORDS: List[str] = [
-    "vôlei",
-    "futebol",
-    "basquete",
-    "f1",
-    "economia",
-]  # ajuste como quiser
+LATEST_ARTICLE = {"title": "", "body": "", "source": "", "link": "", "created": ""}
+
+_scheduler = None
 
 def job_run():
-    """Job que roda periodicamente e guarda o último artigo por keyword."""
-    try:
-        count = 0
-        for kw in KEYWORDS:
-            data = fetch_latest_gnews(kw)
-            if data:
-                LATEST[kw] = data
-                count += 1
-        log.info("[JOB] Atualizado %s keywords em %s", count, datetime.utcnow().isoformat())
-    except Exception as e:
-        log.exception("Erro no job_run: %s", e)
+    global LATEST_ARTICLE
+    keywords = [
+        "litoral norte de sao paulo",
+        "ilhabela",
+        "ubatuba",
+        "sao sebastiao",
+        "caraguatatuba",
+        "futebol",
+        "formula 1",
+        "regata",
+        "surf",
+        "vôlei",
+        "brasil",
+        "mundo",
+    ]
+    for kw in keywords:
+        items = fetch_rss(kw, limit=1)
+        if not items:
+            continue
+        it = items[0]
+        body = it["summary"] or it["title"]
+        # Aceita corpo curto — não bloqueia publicação
+        LATEST_ARTICLE = {
+            "title": it["title"],
+            "body": body,
+            "source": it["source"] or "Google News",
+            "link": it["link"],
+            "created": datetime.now(timezone.utc).isoformat()
+        }
+        log.info("[JOB] Atualizado com '%s' (%s)", it["title"], it["source"] or "Google News")
+        break
 
-def start_scheduler_if_needed():
-    """Inicia o APScheduler (para modo worker local/comando manual)."""
-    jobstores = {"default": MemoryJobStore()}
-    executors = {"default": ThreadPoolExecutor(5)}
-    scheduler = BackgroundScheduler(jobstores=jobstores, executors=executors, timezone="UTC")
-    scheduler.add_job(job_run, "interval", minutes=5, id="job_run", max_instances=1, coalesce=True)
-    scheduler.start()
+def start_scheduler():
+    global _scheduler
+    if _scheduler and _scheduler.running:
+        return _scheduler
+    _scheduler = BackgroundScheduler()
+    _scheduler.add_job(job_run, "interval", minutes=5, id="job_run", replace_existing=True)
+    _scheduler.start()
     log.info("Scheduler iniciado")
-    # roda uma vez no boot
     job_run()
-    return scheduler
+    return _scheduler
 
 if __name__ == "__main__":
-    # Opcional: permite rodar localmente: `python main.py`
-    start_scheduler_if_needed()
-    # Mantém processo vivo quando executado direto
+    start_scheduler()
     import time
     while True:
-        time.sleep(3600)
+        time.sleep(60)
