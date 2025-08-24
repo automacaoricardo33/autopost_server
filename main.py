@@ -1,6 +1,7 @@
 import os, time, json, threading, re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
+import email.utils as eut  # para parsear pubDate RFC2822
 import requests
 from bs4 import BeautifulSoup
 from readability import Document
@@ -9,15 +10,17 @@ from flask import Flask, jsonify
 # ================== CONFIG ==================
 PORT = int(os.environ.get("PORT", "10000"))
 
-# Palavras‑chave separadas por vírgula
-# Ex.: "caraguatatuba, ilhabela, são sebastião, trânsito, futebol, fórmula 1"
+# Palavras‑chave (separadas por vírgulas)
 KEYWORDS = [k.strip() for k in os.environ.get("KEYWORDS", "").split(",") if k.strip()]
 
 # IA opcional (TextSynth). Se vazio, publica texto limpo.
 TEXTSYNTH_KEY = os.environ.get("TEXTSYNTH_KEY", "")
 
+# Janela de recência: só aceitar itens com pubDate dentro dessas horas
+RECENT_HOURS = int(os.environ.get("RECENT_HOURS", "12"))  # padrão 12h
+
 # Agendador
-SCRAPE_INTERVAL = int(os.environ.get("SCRAPE_INTERVAL", "300"))  # 5min default
+SCRAPE_INTERVAL = int(os.environ.get("SCRAPE_INTERVAL", "300"))  # 5min
 WAIT_GNEWS = int(os.environ.get("WAIT_GNEWS", "20"))             # espera para news.google.com
 TIMEOUT = int(os.environ.get("TIMEOUT", "30"))
 
@@ -129,6 +132,21 @@ def build_json(title: str, html: str, img: str, source: str):
         "generated_at": datetime.now(timezone.utc).isoformat()
     }
 
+def is_recent(pub_dt: datetime, now_utc: datetime, max_hours: int) -> bool:
+    if not isinstance(pub_dt, datetime): return False
+    if pub_dt.tzinfo is None:  # assume UTC se vier sem timezone
+        pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+    delta = now_utc - pub_dt.astimezone(timezone.utc)
+    return timedelta(0) <= delta <= timedelta(hours=max_hours)
+
+def parse_rfc2822(dt_text: str):
+    try:
+        # pubDate padrão RSS: "Sun, 24 Aug 2025 14:05:00 GMT"
+        dt = eut.parsedate_to_datetime(dt_text.strip())
+        return dt
+    except Exception:
+        return None
+
 
 # ================== EXTRAÇÃO ==================
 def extract_from_article_url(url: str):
@@ -182,19 +200,42 @@ def extract_from_article_url(url: str):
         log("[extract_from_article_url] erro:", e, "| url=", url)
         return "", "", "", url
 
+def gnews_query_with_when(keyword: str) -> str:
+    # Se RECENT_HOURS <= 48h usamos when:XXh, senão converte para dias (aprox.)
+    if RECENT_HOURS <= 48:
+        when_token = f"when:{RECENT_HOURS}h"
+    else:
+        days = max(1, RECENT_HOURS // 24)
+        when_token = f"when:{days}d"
+    # Monta a query "keyword when:XXh"
+    q = f"{keyword} {when_token}"
+    return f"https://news.google.com/rss/search?q={quote_plus(q)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+
 def pick_from_gnews(keyword: str):
     """
-    Usa Google News RSS para a keyword e tenta pegar a 1ª matéria válida.
+    Usa Google News RSS para a keyword e tenta pegar a 1ª matéria RECENTE válida.
     Retorna (title, content_html, image_url, final_url)
     """
-    feed = f"https://news.google.com/rss/search?q={quote_plus(keyword)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+    feed = gnews_query_with_when(keyword)
+    now_utc = datetime.now(timezone.utc)
     try:
         r = http_get(feed, timeout=TIMEOUT, accept="application/rss+xml,application/xml,text/xml,text/html")
         soup = BeautifulSoup(r.content, "xml")
         items = soup.find_all(["item", "entry"])
         for it in items:
+            # Filtra por pubDate (recência)
+            pub = None
+            for tag in ["pubDate", "updated", "published"]:
+                t = it.find(tag)
+                if t and t.text:
+                    pub = parse_rfc2822(t.text) if tag == "pubDate" else parse_rfc2822(t.text) or None
+                    # Muitas vezes updated/published não estão em RFC — se não der, ignora
+                    break
+            if pub and not is_recent(pub, now_utc, RECENT_HOURS):
+                # muito antigo para nossa janela — pula
+                continue
+
             link = ""
-            # link pode vir em <link> ou no <guid>
             link_tag = it.find("link")
             if link_tag:
                 link = link_tag.get("href") or (link_tag.text or "").strip()
@@ -250,10 +291,10 @@ TEXTO ORIGINAL:
 def scrape_once():
     """
     Para cada KEYWORD:
-      - consulta Google News RSS
+      - consulta Google News RSS (com when:XXh)
+      - filtra por pubDate dentro de RECENT_HOURS
       - extrai a primeira matéria válida
-      - reescreve (se TEXTSYNTH_KEY), salva em /artigos/ultimo.json
-    Para o WordPress basta ler /artigos/ultimo.json
+      - reescreve (se TEXTSYNTH_KEY) e salva em /artigos/ultimo.json
     """
     global LAST_ARTICLE
     if not KEYWORDS:
@@ -264,7 +305,7 @@ def scrape_once():
         title, content_html, img, final = pick_from_gnews(kw)
         plain = extract_plain(content_html)
         if len(plain) < 400:
-            log("[JOB] Conteúdo curto para kw:", kw)
+            log("[JOB] Conteúdo curto/antigo para kw:", kw)
             continue
 
         new_title, rewritten_html, meta = textsynth_rewrite(title, plain)
@@ -279,7 +320,8 @@ def scrape_once():
         log("[JOB] ultimo.json atualizado com:", data["title"][:90], "| kw:", kw)
         return
 
-    log("[JOB] Nenhuma keyword retornou conteúdo suficiente.")
+    log("[JOB] Nenhuma keyword recente retornou conteúdo suficiente.")
+
 
 def scheduler_loop():
     while True:
@@ -293,7 +335,7 @@ def scheduler_loop():
 # ================== ROTAS ==================
 @app.route("/")
 def idx():
-    return "AutoPost Render (keywords→GNews→ultimo.json) OK", 200
+    return "AutoPost Render (keywords→GNews→RECENT_HOURS→ultimo.json) OK", 200
 
 @app.route("/health")
 def health():
@@ -301,7 +343,8 @@ def health():
         "ok": True,
         "time": datetime.utcnow().isoformat(),
         "keywords": KEYWORDS,
-        "interval": SCRAPE_INTERVAL
+        "interval": SCRAPE_INTERVAL,
+        "recent_hours": RECENT_HOURS
     })
 
 @app.route("/job/run")
