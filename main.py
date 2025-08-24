@@ -1,6 +1,6 @@
 import os, json, time, signal, hashlib
 from pathlib import Path
-from flask import Flask, Response, jsonify, Blueprint
+from flask import Flask, Response, jsonify, Blueprint, request
 from apscheduler.schedulers.background import BackgroundScheduler
 from scraper import get_fresh_article_candidates, fetch_and_extract
 from textsynth_client import rewrite_with_textsynth
@@ -17,9 +17,10 @@ LAST_HTML = ART_DIR / 'ultimo.html'
 # --- Config (env)
 REGIAO = os.getenv('REGIAO', 'Litoral Norte de Sao Paulo')
 RUN_INTERVAL_MIN = int(os.getenv('RUN_INTERVAL_MIN', '15'))
-FETCH_WAIT_SECONDS = int(os.getenv('FETCH_WAIT_SECONDS', '8'))  # reduzido p/ agilizar
+# tempo de “descanso” entre candidatos (antibloqueio)
+FETCH_WAIT_SECONDS = int(os.getenv('FETCH_WAIT_SECONDS', '8'))
 MAX_PER_RUN = int(os.getenv('MAX_PER_RUN', '1'))
-TIMEOUT_SECONDS = int(os.getenv('TIMEOUT_SECONDS', '45'))
+TIMEOUT_SECONDS = int(os.getenv('TIMEOUT_SECONDS', '60'))
 
 app = Flask(__name__)
 scheduler = BackgroundScheduler()
@@ -62,18 +63,17 @@ def job_run():
             title_hint = cand.get('title', 'Noticia')
             app.logger.info(f'[JOB] Abrindo: {url}')
 
-            # pequena espera para evitar bloqueios agressivos
+            # pequena espera geral para reduzir bloqueios
             time.sleep(FETCH_WAIT_SECONDS)
 
             raw = fetch_and_extract(url, timeout=TIMEOUT_SECONDS)
-            if not raw or not raw.get('text'):
+            if not raw or (not raw.get('text') and not raw.get('html')):
                 app.logger.warning(f'[JOB] Conteudo vazio: {url}')
                 continue
 
-            # Log extra: confirmando que o resolvedor funcionou (o fetch_and_extract já resolve a URL do Google News)
             app.logger.info(f"[JOB] Resolvido OK: {url}")
 
-            effective_title = raw.get('title') or title_hint
+            effective_title = (raw.get('title') or '').strip() or title_hint
             if not mark_seen(url, effective_title):
                 app.logger.info(f'[JOB] Ignorado (duplicado): {url}')
                 continue
@@ -127,6 +127,38 @@ def health():
 def run_once():
     job_run()
     return jsonify({'status': 'executed'})
+
+# --- Debug opcional: ver tamanho extraído
+@app.route('/debug/fetch', methods=['GET'])
+def debug_fetch():
+    u = request.args.get('u','').strip()
+    if not u:
+        return jsonify({'ok': False, 'error': 'missing u'})
+    try:
+        raw = fetch_and_extract(u, timeout=TIMEOUT_SECONDS)
+        return jsonify({
+            'ok': True,
+            'title': raw.get('title'),
+            'image': raw.get('image'),
+            'text_len': len(raw.get('text') or ''),
+            'html_len': len(raw.get('html') or ''),
+        })
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+# --- Página inicial com links úteis
+@app.route('/', methods=['GET'])
+def index():
+    return Response(
+        '<h1>Autopost Server</h1>'
+        '<ul>'
+        '<li><a href="/health">/health</a></li>'
+        '<li><a href="/artigos/ultimo.html">/artigos/ultimo.html</a></li>'
+        '<li><a href="/debug/fetch?u=https://news.google.com/rss/articles/...">/debug/fetch</a></li>'
+        '</ul>'
+        '<p>Para rodar 1 ciclo: <code>POST /run-once</code></p>',
+        mimetype='text/html; charset=utf-8'
+    )
 
 # --- Shutdown signals
 def shutdown_handler(signum, frame):
