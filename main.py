@@ -10,22 +10,23 @@ from flask import Flask, jsonify
 # ================== CONFIG ==================
 PORT = int(os.environ.get("PORT", "10000"))
 
-# Palavras‑chave (separadas por vírgulas)
-KEYWORDS = [k.strip() for k in os.environ.get("KEYWORDS", "").split(",") if k.strip()]
+# Palavras‑chave agora aceitam vírgula OU ponto‑e‑vírgula como separador
+_raw_kw = os.environ.get("KEYWORDS", "")
+KEYWORDS = [k.strip() for k in re.split(r"[;,]", _raw_kw) if k.strip()]
 
 # IA opcional (TextSynth). Se vazio, publica texto limpo.
 TEXTSYNTH_KEY = os.environ.get("TEXTSYNTH_KEY", "")
 
 # Janela de recência: só aceitar itens com data dentro dessas horas
-RECENT_HOURS = int(os.environ.get("RECENT_HOURS", "12"))  # ex.: 3 para esportes
+RECENT_HOURS = int(os.environ.get("RECENT_HOURS", "6"))  # mais agressivo p/ tempo real
 
 # Agendador
 SCRAPE_INTERVAL = int(os.environ.get("SCRAPE_INTERVAL", "300"))  # 5 min
-WAIT_GNEWS = int(os.environ.get("WAIT_GNEWS", "20"))             # espera p/ news.google.com
-TIMEOUT = int(os.environ.get("TIMEOUT", "30"))
+WAIT_GNEWS = int(os.environ.get("WAIT_GNEWS", "25"))             # espera p/ news.google.com
+TIMEOUT = int(os.environ.get("TIMEOUT", "45"))
 
-# Requisitos mínimos do conteúdo (mais amigáveis a notas esportivas)
-MIN_CHARS = int(os.environ.get("MIN_CHARS", "220"))
+# Requisitos mínimos do conteúdo (amigáveis a notas esportivas/urgentes)
+MIN_CHARS = int(os.environ.get("MIN_CHARS", "180"))
 MIN_PARAGRAPHS = int(os.environ.get("MIN_PARAGRAPHS", "2"))
 
 # Categoria por cidade (ajuste se quiser)
@@ -272,9 +273,10 @@ def pick_from_gnews(keyword: str):
             if not link:
                 continue
 
-            title, html, img, final = extract_from_article_url(link)
+            title = (it.find("title").text.strip() if it.find("title") else "")
+            title_ex, html, img, final = extract_from_article_url(link)
             if len(extract_plain(html)) >= MIN_CHARS and count_paragraphs(html) >= MIN_PARAGRAPHS:
-                return title, html, img, final
+                return (title_ex or title), html, img, final
 
         return "", "", "", feed
     except Exception as e:
@@ -334,6 +336,7 @@ def scrape_once():
         log("[JOB] Sem KEYWORDS definidas (env KEYWORDS).")
         return
 
+    log("[JOB] Keywords ativas:", KEYWORDS)
     for kw in KEYWORDS:
         title, content_html, img, final = pick_from_gnews(kw)
         plain = extract_plain(content_html)
