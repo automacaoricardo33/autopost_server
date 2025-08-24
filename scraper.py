@@ -1,43 +1,49 @@
-import os, json, time, re, threading
+import os
+import json
+import time
+import re
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote_plus
+from urllib.parse import urlencode, urljoin
+
 import requests
-from flask import Flask, jsonify, send_from_directory, request
+from bs4 import BeautifulSoup
+from dateutil import parser as dateparser
+
+from flask import Flask, jsonify, send_file, Response
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from scraper import (
-    fetch_html,
-    resolve_amp,
-    extract_main_article,
-    pick_image,
-    clean_html_hard,
-    text_only,
-    make_tags
+# -----------------------------
+# CONFIG
+# -----------------------------
+PORT = int(os.getenv("PORT", "10000"))
+KEYWORDS = os.getenv(
+    "KEYWORDS",
+    "litoral norte de sao paulo, ilhabela, sao sebastiao, caraguatatuba, ubatuba, brasil, futebol, formula 1, f1"
+)
+GNEWS_CEID = os.getenv("GNEWS_CEID", "BR:pt-419")  # hl=pt-BR&gl=BR&ceid=BR:pt-419
+MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "8"))
+RESOLVE_WAIT_SECONDS = int(os.getenv("RESOLVE_WAIT_SECONDS", "5"))  # tempo de espera antes de resolver link do GNews
+TIMEOUT_SECONDS = int(os.getenv("TIMEOUT_SECONDS", "20"))
+RECENCY_HOURS = int(os.getenv("RECENCY_HOURS", "24"))
+
+TEXTSYNTH_KEY = os.getenv("TEXTSYNTH_KEY", "").strip()  # se tiver, usa TextSynth para reescrever
+
+OUT_DIR = os.path.join(os.getcwd(), "artigos")
+OUT_JSON = os.path.join(OUT_DIR, "ultimo.json")
+
+MIN_CHARS = 450
+MIN_P_COUNT = 3
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/123.0.0.0 Safari/537.36"
 )
 
-# ----------------------------- Config -----------------------------
-PORT                = int(os.getenv("PORT", "10000"))
-REQUEST_TIMEOUT     = int(os.getenv("REQUEST_TIMEOUT", "15"))
-SLEEP_BEFORE_RESOLVE= float(os.getenv("SLEEP_BEFORE_RESOLVE", "3"))  # segs
-KW_SINCE_HOURS      = int(os.getenv("KW_SINCE_HOURS", "12"))
-KEYWORDS_ENV        = os.getenv("KEYWORDS", "litoral norte de sao paulo, ilhabela, sao sebastiao, caraguatatuba, ubatuba, futebol, formula 1, brasil")
-KEYWORDS            = [k.strip() for k in KEYWORDS_ENV.split(",") if k.strip()]
-TEXTSYNTH_KEY       = os.getenv("TEXTSYNTH_KEY", "").strip()
-
-HL = "pt-BR"
-GL = "BR"
-CEID = "BR:pt-419"
-
-DATA_DIR = "/mnt/data"
-os.makedirs(DATA_DIR, exist_ok=True)
-LAST_JSON_PATH = os.path.join(DATA_DIR, "ultimo.json")
-
-app = Flask(__name__)
-
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-
-# ------------------------ Prompt / Reescrita ------------------------
-PROMPT_PERSONA = """PERSONA
+# -----------------------------
+# PROMPT E FORMATO
+# -----------------------------
+PROMPT_JORNAL = """PERSONA
 Você é um jornalista digital e especialista em SEO, responsável por redigir notícias para o portal "Voz do Litoral". Seu público são os moradores das cidades de Caraguatatuba, São Sebastião, Ilhabela e Ubatuba. Seu objetivo é pegar uma notícia de uma fonte externa e reescrevê-la de forma clara, objetiva e otimizada, sempre conectando o assunto à realidade e ao interesse local.
 
 TAREFA PRINCIPAL
@@ -55,148 +61,438 @@ Requisitos: Deve ser informativo, cativante e conter as principais palavras-chav
 Formato: Parágrafos de texto simples.
 
 Requisitos:
-- Deve ter entre 4 e 5 parágrafos.
-- O primeiro parágrafo (lide) deve resumir a notícia de forma direta.
-- O texto deve ser claro, objetivo e jornalístico.
-- Deve ser original, reescrevendo a informação da fonte, não copiando.
+
+Deve ter entre 4 e 5 parágrafos.
+
+O primeiro parágrafo (lide) deve resumir a notícia de forma direta.
+
+O texto deve ser claro, objetivo e jornalístico.
+
+Deve ser original, reescrevendo a informação da fonte, não copiando.
 
 3. Fonte
 Formato: Fonte: [Nome do Veículo Original]
+
+Requisitos: Cite o nome do portal de onde a notícia foi extraída (ex: G1, CNN Brasil, Radar Litoral).
 
 4. Linha Separadora
 Formato: ---
 
 5. Meta Descrição
-Formato: **Meta descrição:** [até 160 caracteres]
+Formato: **Meta descrição:** seguido do texto.
+
+Requisitos: Um resumo curto e atraente (máximo de 160 caracteres) para os buscadores (Google). Deve conter as palavras-chave mais importantes.
 
 6. Linha Separadora
 Formato: ---
 
 7. Tags
-Formato: **Tags:** [5 a 10 palavras, minúsculas, separadas por vírgula; incluir cidades do Litoral Norte quando pertinente]
+Formato: **Tags:** seguido das palavras, separadas por vírgula.
+
+Requisitos: Uma lista de 5 a 10 palavras-chave relevantes, em letras minúsculas, separadas por vírgula. Inclua nomes de cidades do Litoral Norte sempre que pertinente.
 """
 
-def call_textsynth_rewrite(source_url: str, src_title: str, src_plain: str, src_site: str) -> str:
-    """
-    Retorna MARKDOWN no formato exigido pelo prompt.
-    Se TEXTSYNTH_KEY não estiver definido, faz um rewrite simples (fallback).
-    """
-    content = src_plain.strip()
-    if not content:
-        return ""
+# -----------------------------
+# FLASK
+# -----------------------------
+app = Flask(__name__)
+_last_article = None  # cache em memória
 
-    if TEXTSYNTH_KEY:
-        # TextSynth GPT-J endpoint
-        prompt = f"""{PROMPT_PERSONA}
 
-URL da fonte: {source_url}
+@app.route("/")
+def index():
+    return "OK - Autopost server"
 
-TÍTULO ORIGINAL:
-{src_title.strip()}
 
-TEXTO BASE (apenas para referência; reescreva com suas palavras):
-{content}
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "time": datetime.now(timezone.utc).isoformat()})
 
-GERE APENAS A SAÍDA FINAL NO FORMATO EXATO EXIGIDO (markdown).
-"""
+
+@app.route("/artigos/ultimo.json")
+def artigos_ultimo_json():
+    global _last_article
+    # tenta ler do disco se não tiver em memória
+    if _last_article is None and os.path.exists(OUT_JSON):
         try:
-            resp = requests.post(
-                "https://api.textsynth.com/v1/engines/gptj_6B/completions",
-                headers={"Authorization": f"Bearer {TEXTSYNTH_KEY}"},
-                json={
-                    "prompt": prompt,
-                    "max_tokens": 600,
-                    "temperature": 0.5,
-                    "stop": None
-                },
-                timeout=REQUEST_TIMEOUT
-            )
-            if resp.status_code == 200:
-                j = resp.json()
-                out = (j.get("text") or "").strip()
-                # Pequena sanidade: garantir que comece com ### (Título)
-                if not out.startswith("###"):
-                    out = "### " + (src_title.strip() or "Notícia no Litoral Norte") + "\n\n" + out
-                return out
+            with open(OUT_JSON, "r", encoding="utf-8") as f:
+                _last_article = json.load(f)
         except Exception:
             pass
+    if _last_article is None:
+        return jsonify({"ok": True, "has_last": False})
+    return jsonify({"ok": True, "has_last": True, **_last_article})
 
-    # --------- Fallback: cria a saída no formato do prompt (simples) ---------
-    # Quebra em 4-5 parágrafos
-    txt = content
-    paras = [p.strip() for p in re.split(r"\n{2,}", txt) if p.strip()]
-    if len(paras) < 4:
-        # tenta cortar por pontos
-        sentences = re.split(r"(?<=[\.\!\?])\s+", txt)
-        chunk, current, out = 4, "", []
-        for s in sentences:
-            if len(current) + len(s) < 350:
-                current += (" " if current else "") + s
-            else:
-                if current:
-                    out.append(current.strip())
-                current = s
-        if current:
-            out.append(current.strip())
-        paras = out[:5] if out else [txt]
 
-    body = "\n\n".join(paras[:5])
-    title_md = f"### {src_title.strip() or 'Atualização no Litoral Norte'}"
-    meta_desc = (src_title[:150] + "...") if len(src_title) > 150 else src_title
-    tags = make_tags(src_title + " " + src_plain)
+# -----------------------------
+# FUNÇÕES AUXILIARES
+# -----------------------------
+def http_get(url, timeout=TIMEOUT_SECONDS, allow_redirects=True):
+    r = requests.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT}, allow_redirects=allow_redirects)
+    r.raise_for_status()
+    return r
 
-    md = (
-        f"{title_md}\n"
-        f"{body}\n\n"
-        f"Fonte: {src_site or 'Fonte externa'}\n\n"
-        f"---\n\n"
-        f"**Meta descrição:** {meta_desc}\n\n"
-        f"---\n\n"
-        f"**Tags:** {', '.join(tags)}\n"
-    )
-    return md
 
-def md_to_html(md: str) -> str:
-    # conversor bem simples (headline + parágrafos + negrito + separadores)
-    h = md.strip()
-    h = re.sub(r"(?m)^###\s+(.*)$", r"<h2>\1</h2>", h)
-    h = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", h)
-    h = h.replace("\n---\n", "\n<hr/>\n")
-    # parágrafos: linhas separadas por \n\n
-    parts = [p.strip() for p in re.split(r"\n{2,}", h) if p.strip()]
-    html_parts = []
-    for p in parts:
-        if p.startswith("<h2>") and p.endswith("</h2>"):
-            html_parts.append(p)
-        elif p == "<hr/>" or p == "<hr/>":
-            html_parts.append("<hr/>")
+def fetch_feed_for_keyword(kw: str):
+    # usa a busca do Google News (RSS) por palavra‑chave
+    base = "https://news.google.com/rss/search"
+    q = {
+        "q": kw,
+        "hl": "pt-BR",
+        "gl": "BR",
+        "ceid": GNEWS_CEID,
+    }
+    url = f"{base}?{urlencode(q)}"
+    r = http_get(url)
+    soup = BeautifulSoup(r.content, "xml")
+    items = soup.select("item")
+    results = []
+    for it in items:
+        title = it.title.text.strip() if it.title else ""
+        link = it.link.text.strip() if it.link else ""
+        pubdate = it.pubDate.text.strip() if it.pubDate else ""
+        try:
+            dt = dateparser.parse(pubdate)
+        except Exception:
+            dt = None
+        results.append({"title": title, "link": link, "pubdate": dt})
+    return results
+
+
+def is_recent(dt):
+    if not dt:
+        return False
+    now = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (now - dt) <= timedelta(hours=RECENCY_HOURS)
+
+
+def wait_then_resolve_gnews(url: str) -> str:
+    # Espera para o GNews construir o redirect
+    wait = max(0, RESOLVE_WAIT_SECONDS)
+    if wait:
+        print(f"[GNEWS] aguardando {wait} s: {url}")
+        time.sleep(wait)
+    # A maioria dos links do GNews redireciona para a matéria final via 302
+    try:
+        r = http_get(url, allow_redirects=True)
+        return r.url  # URL final após redirecionamentos
+    except Exception as e:
+        print(f"[GNEWS] erro ao resolver; fallback -> {url} ({e})")
+        return url
+
+
+def extract_og_image(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for sel, attr in [
+        ('meta[property="og:image"]', "content"),
+        ('meta[name="twitter:image"]', "content"),
+        ('link[rel="image_src"]', "href"),
+    ]:
+        m = soup.select_one(sel)
+        if m and m.get(attr):
+            return m.get(attr).strip()
+    # fallback: primeira <img>
+    img = soup.find("img")
+    if img and img.get("src"):
+        return img["src"].strip()
+    return ""
+
+
+def extract_title_text(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+
+    # título
+    title = ""
+    if soup.title and soup.title.text:
+        title = soup.title.text.strip()
+
+    # pega blocos com mais parágrafos
+    best = None
+    best_score = 0
+    for node in soup.find_all(["article", "main", "div", "section"]):
+        text = " ".join(p.get_text(" ", strip=True) for p in node.find_all("p"))
+        pcount = len(node.find_all("p"))
+        length = len(text)
+        score = pcount * 10 + length
+        if score > best_score:
+            best = text
+            best_score = score
+
+    # limpeza básica
+    if not best:
+        best = soup.get_text(" ", strip=True)
+    best = re.sub(r"\s+", " ", best).strip()
+
+    # quebra em parágrafos simples
+    paragraphs = [p.strip() for p in re.split(r"(?<=\.)\s+", best) if p.strip()]
+    # junta em blocos maiores
+    buf = []
+    current = ""
+    for sent in paragraphs:
+        if len(current) + len(sent) < 400:
+            current = (current + " " + sent).strip()
         else:
-            html_parts.append(f"<p>{p}</p>")
-    return "\n".join(html_parts)
+            if current:
+                buf.append(current)
+            current = sent
+    if current:
+        buf.append(current)
 
-# ------------------------- Google News helpers -------------------------
-def gnews_search_feed(keyword: str) -> str:
-    # usa filtro de recência when:6h para diminuir velharias
-    q = quote_plus(f'{keyword} when:6h')
-    return f"https://news.google.com/rss/search?q={q}&hl={HL}&gl={GL}&ceid={CEID}"
+    # garante pelo menos alguns parágrafos
+    if len(buf) < 3:
+        # tentativa alternativa: pegar <p> diretamente
+        ps = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+        ps = [p for p in ps if len(p) > 40]
+        if ps:
+            buf = ps[:5]
 
-def iter_gnews_items(xml_text: str):
-    # parse manual simples (sem feedparser pra diminuir deps)
-    items = re.split(r"</item>\s*<item>", xml_text, flags=re.I)
-    if len(items) == 1:
-        items = re.findall(r"<item>.*?</item>", xml_text, flags=re.I|re.S)
-    for raw in items:
-        # link
-        mlink = re.search(r"<link>(.+?)</link>", raw, flags=re.I|re.S)
-        link = (mlink.group(1).strip() if mlink else "")
-        # title
-        mtitle = re.search(r"<title>(.+?)</title>", raw, flags=re.I|re.S)
-        t = (mtitle.group(1) if mtitle else "")
-        t = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", t, flags=re.S).strip()
-        # pubDate
-        mdate = re.search(r"<pubDate>(.+?)</pubDate>", raw, flags=re.I|re.S)
-        pub = (mdate.group(1).strip() if mdate else "")
-        yield {"title": t, "link": link, "pubDate": pub}
+    text_join = "\n\n".join(buf[:6])
+    return title, text_join
 
-def resolve_gnews_link(url: str) -> str:
-    # Espera curto, tenta seguir redirects do próprio Google News
+
+def host_from_url(u: str) -> str:
+    try:
+        return re.sub(r"^www\.", "", requests.utils.urlparse(u).netloc)
+    except Exception:
+        return ""
+
+
+def generate_with_textsynth(source_url: str, vehicle: str, src_title: str, clean_text: str):
+    if not TEXTSYNTH_KEY:
+        return None  # sem TextSynth -> deixa fallback
+
+    # Monta o prompt pedindo a ESTRUTURA exata:
+    prompt = f"""{PROMPT_JORNAL}
+
+URL de origem: {source_url}
+
+TÍTULO DA FONTE:
+{src_title}
+
+TEXTO DA FONTE (LIMPO):
+{clean_text}
+
+GERE A SAÍDA NESTE FORMATO EXATO:
+
+### [Seu Título Otimizado]
+[Parágrafo 1]
+[Parágrafo 2]
+[Parágrafo 3]
+[Parágrafo 4]
+[Parágrafo 5 opcional]
+
+Fonte: {vehicle}
+---
+**Meta descrição:** [até 160 caracteres]
+---
+**Tags:** [5 a 10 termos em minúsculas, separados por vírgula; incluir cidades se fizer sentido]
+"""
+
+    # TextSynth API – formato compatível com /v1/engines/gptj_6B/completions
+    # Referência básica: prompt + max_tokens + temperature
+    url = "https://api.textsynth.com/v1/engines/gptj_6B/completions"
+    headers = {
+        "Authorization": f"Bearer {TEXTSYNTH_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "prompt": prompt,
+        "max_tokens": 700,
+        "temperature": 0.5,
+        "top_p": 0.95,
+        "stop": None,
+    }
+    try:
+        r = requests.post(url, headers=headers, json=body, timeout=TIMEOUT_SECONDS)
+        if r.status_code >= 200 and r.status_code < 300:
+            data = r.json()
+            text = data.get("text", "").strip()
+            return text
+        else:
+            print(f"[AI] TextSynth HTTP {r.status_code}: {r.text[:300]}")
+    except Exception as e:
+        print(f"[AI] erro TextSynth: {e}")
+    return None
+
+
+def build_prompt_output(vehicle: str, title: str, text: str, cities_hint=True):
+    # monta 4–5 parágrafos com lide + corpo
+    ps = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    if len(ps) < 4:
+        # força quebras a cada ~2–3 frases
+        sentences = [s.strip() for s in re.split(r"(?<=\.)\s+", text) if s.strip()]
+        ps = []
+        buf = []
+        for s in sentences:
+            buf.append(s)
+            if len(" ".join(buf)) > 220:
+                ps.append(" ".join(buf))
+                buf = []
+        if buf:
+            ps.append(" ".join(buf))
+    ps = ps[:5]
+    if len(ps) < 4 and text:
+        ps = ps + [text][:4 - len(ps)]
+
+    # título enxuto
+    title_clean = re.sub(r"\s+", " ", title).strip()
+    if len(title_clean) > 120:
+        title_clean = title_clean[:117] + "..."
+
+    # meta descrição (até 160)
+    meta = re.sub(r"\s+", " ", " ".join(ps))[:160]
+    # tags automatizadas
+    base = (title_clean + " " + " ".join(ps)).lower()
+    words = re.findall(r"[a-zà-úãõâêîôûç0-9\-]{3,}", base, flags=re.IGNORECASE)
+    stop = set("""
+a o os as um uma uns umas de do da dos das em no na nos nas para por com sem sob sobre entre e ou que se sua seu suas seus
+ao à às aos até como mais menos muito muita muitos muitas já não sim foi será ser está estão era são pelo pela pelos pelas
+lhe eles elas dia ano anos hoje ontem amanhã the and of to in on for with from
+caraguatatuba são sebastião ilhabela ubatuba litoral norte brasil
+""".split())
+    freq = {}
+    for w in words:
+        wl = w.lower()
+        if wl not in stop and not wl.isdigit():
+            freq[wl] = freq.get(wl, 0) + 1
+    tags = sorted(freq.keys(), key=lambda k: -freq[k])[:7]
+
+    if cities_hint:
+        for c in ["caraguatatuba", "são sebastião", "ilhabela", "ubatuba", "litoral norte"]:
+            if c not in tags and c in base and len(tags) < 10:
+                tags.append(c)
+
+    # formata exatamente como solicitado
+    out_lines = []
+    out_lines.append(f"### {title_clean}")
+    for p in ps[:5]:
+        out_lines.append(p)
+    out_lines.append(f"\nFonte: {vehicle}\n")
+    out_lines.append("---")
+    out_lines.append(f"**Meta descrição:** {meta.strip()}")
+    out_lines.append("---")
+    out_lines.append("**Tags:** " + ", ".join(tags))
+    return "\n\n".join(out_lines)
+
+
+def make_article_object(source_url: str, vehicle: str, final_render: str, image_url: str, published_iso: str):
+    # Ser devolvido no /artigos/ultimo.json
+    return {
+        "url": source_url,
+        "vehicle": vehicle,
+        "render_markdown": final_render,
+        "image": image_url,
+        "published_at": published_iso,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def write_last_article(obj: dict):
+    global _last_article
+    os.makedirs(OUT_DIR, exist_ok=True)
+    with open(OUT_JSON, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    _last_article = obj
+
+
+# -----------------------------
+# JOB PRINCIPAL
+# -----------------------------
+def job_run():
+    try:
+        keywords = [k.strip() for k in KEYWORDS.split(",") if k.strip()]
+        if not keywords:
+            print("[JOB] Sem KEYWORDS definidas.")
+            return
+
+        total_published = 0
+        for kw in keywords:
+            if total_published >= MAX_PER_RUN:
+                break
+
+            items = fetch_feed_for_keyword(kw)
+            if not items:
+                continue
+
+            # pega só recentes
+            recent_items = [it for it in items if is_recent(it["pubdate"])]
+            if not recent_items:
+                print(f"[JOB] Nenhum item RECENTE para: {kw}")
+                continue
+
+            # processa do mais recente para trás (na prática, o feed já vem ordenado)
+            for it in recent_items[:MAX_PER_RUN - total_published]:
+                gnews_link = it["link"]
+                pub_dt = it["pubdate"] or datetime.now(timezone.utc)
+                pub_iso = pub_dt.astimezone(timezone.utc).isoformat()
+
+                # resolve link do GNews
+                final_url = wait_then_resolve_gnews(gnews_link)
+
+                # baixa página final
+                try:
+                    r = http_get(final_url, timeout=TIMEOUT_SECONDS, allow_redirects=True)
+                except Exception:
+                    # em último caso, tenta o link do GNews
+                    try:
+                        r = http_get(gnews_link, timeout=TIMEOUT_SECONDS, allow_redirects=True)
+                        final_url = r.url
+                    except Exception:
+                        print(f"[JOB] Falha GET em: {gnews_link}")
+                        continue
+
+                html = r.text
+                if not html or len(html) < 500:
+                    print(f"[JOB] HTML curto: {final_url}")
+                    continue
+
+                img = extract_og_image(html)
+                src_title, clean_text = extract_title_text(html)
+
+                if len(clean_text) < MIN_CHARS or clean_text.count(".") < MIN_P_COUNT:
+                    print(f"[JOB] Conteúdo insuficiente (kw): {kw}")
+                    continue
+
+                vehicle = host_from_url(final_url) or "Fonte original"
+
+                # Geração via IA (TextSynth) se disponível
+                rendered = generate_with_textsynth(final_url, vehicle, src_title, clean_text)
+                if not rendered or "###" not in rendered:
+                    # fallback: montar no formato do prompt
+                    rendered = build_prompt_output(vehicle, src_title or it["title"] or "Atualização", clean_text)
+
+                obj = make_article_object(final_url, vehicle, rendered, img, pub_iso)
+                write_last_article(obj)
+                total_published += 1
+
+                print(f"[JOB] Publicado: {src_title[:80]}... ({final_url})")
+
+        if total_published == 0:
+            print("[JOB] Nenhuma keyword RECENTE com texto suficiente.")
+
+    except Exception as e:
+        print(f"[JOB] Erro fatal: {e}")
+
+
+# -----------------------------
+# SCHEDULER
+# -----------------------------
+scheduler = BackgroundScheduler(timezone="UTC")
+# roda a cada 5 minutos por padrão
+scheduler.add_job(job_run, "interval", minutes=5, id="job_run")
+scheduler.start()
+
+
+# -----------------------------
+# MAIN
+# -----------------------------
+if __name__ == "__main__":
+    # primeiro run imediato
+    try:
+        job_run()
+    except Exception as e:
+        print(f"[BOOT] job_run falhou: {e}")
+
+    app.run(host="0.0.0.0", port=PORT)
