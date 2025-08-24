@@ -1,5 +1,7 @@
-flask==3.0.3
-requests==2.32.3
-beautifulsoup4==4.12.3
-lxml==5.2.2
-readability-lxml==0.8.1
+flask
+requests
+beautifulsoup4
+readability-lxml
+lxml
+lxml_html_clean
+apscheduler
