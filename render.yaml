@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: autopost-server
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: ""
+    autoDeploy: true
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
