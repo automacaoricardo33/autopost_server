@@ -1,78 +1,47 @@
-# -*- coding: utf-8 -*-
-"""
-main.py — orquestra o agendador e a publicação
-"""
+# ... imports existentes ...
+from scraper import fetch_rss, is_recent, TOPSTORIES_URL, synthesize_summary_from_page, domain_name, post_signature, SeenStore
+# ----------------------------------------------
 
-from __future__ import annotations
+# CHANGE: parâmetros padrão voltados a volume (pode ajustar por ENV)
+FETCH_WAIT_SECONDS = getenv_int("FETCH_WAIT_SECONDS", 10)  # espera menor
+WAIT_GNEWS = getenv_int("WAIT_GNEWS", 2)
+RUN_INTERVAL_MIN = getenv_int("RUN_INTERVAL_MIN", 3)
 
-import logging
-import os
-import sys
-import time
-from typing import List
+# Limites/filtros mais permissivos
+MIN_CHARS = getenv_int("MIN_CHARS", 120)          # antes era 220
+MIN_PARAGRAPHS = getenv_int("MIN_PARAGRAPHS", 1)  # aceita 1 parágrafo
+RECENT_HOURS = getenv_int("RECENT_HOURS", 12)     # janela maior
 
-from apscheduler.schedulers.background import BackgroundScheduler
+# Volume por tier
+MAX_PER_RUN_PRIMARY = getenv_int("MAX_PER_RUN_PRIMARY", 3)
+MAX_PER_RUN_SECONDARY = getenv_int("MAX_PER_RUN_SECONDARY", 5)
 
-from scraper import fetch_rss, is_recent
+# Permite aceitar item sem summary e montar a partir da página
+ALLOW_SUMMARY_FALLBACK = getenv_str("ALLOW_SUMMARY_FALLBACK", "true").lower() == "true"
 
-# -----------------------------------------------------------------------------
-# LOGGING
-# -----------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s:%(name)s:%(message)s",
-    stream=sys.stdout,
-)
-logger = logging.getLogger("main")
+# CHANGE: duas listas — primária (litoral) e secundária (gerais)
+KEYWORDS_PRIMARY = [
+    "litoral norte de sao paulo",
+    "ilhabela",
+    "sao sebastiao",
+    "caraguatatuba",
+    "ubatuba",
+]
 
-# -----------------------------------------------------------------------------
-# CONFIG (carrega de env ou usa padrões — você pode trocar pelos seus getters)
-# -----------------------------------------------------------------------------
-def getenv_int(key: str, default: int) -> int:
-    try:
-        return int(os.getenv(key, str(default)).strip())
-    except Exception:
-        return default
+KEYWORDS_SECONDARY = [
+    "futebol",
+    "formula 1",
+    "f1",
+    "governo do estado de são paulo",
+    "regata",
+    "surf",
+    "vôlei",
+    "brasil",
+    "mundo",
+]
 
-
-def getenv_str(key: str, default: str) -> str:
-    return os.getenv(key, default)
-
-
-# espelha os campos do seu painel
-FETCH_WAIT_SECONDS = getenv_int("FETCH_WAIT_SECONDS", 20)  # entre publicações finais
-WAIT_GNEWS = getenv_int("WAIT_GNEWS", 5)  # entre requests de feed
-MAX_PER_RUN = getenv_int("MAX_PER_RUN", 1)
-
-MIN_CHARS = getenv_int("MIN_CHARS", 220)
-MIN_PARAGRAPHS = getenv_int("MIN_PARAGRAPHS", 2)
-RECENT_HOURS = getenv_int("RECENT_HOURS", 3)
-
-RUN_INTERVAL_MIN = getenv_int("RUN_INTERVAL_MIN", 5)
-
-# região é só metadado
-REGIAO = getenv_str("REGIAO", "Litoral Norte de Sao Paulo")
-
-# Keywords: separadas por vírgula
-KEYWORDS_RAW = getenv_str(
-    "KEYWORDS",
-    "litoral norte de sao paulo, ilhabela, sao sebastiao, caraguatatuba, ubatuba, "
-    "futebol, formula 1, f1, governo do estado de são paulo, regata, surf, vôlei, brasil, mundo",
-)
-
-# normaliza keywords
-KEYWORDS: List[str] = [k.strip() for k in KEYWORDS_RAW.split(",") if k.strip()]
-
-# -----------------------------------------------------------------------------
-# FUNÇÕES DE APOIO
-# -----------------------------------------------------------------------------
-def _count_paragraphs(text: str) -> int:
-    # considera linhas em branco como quebra
-    parts = [p for p in text.replace("\r", "").split("\n\n") if p.strip()]
-    # fallback: se veio tudo em uma linha, tenta por ponto final
-    if len(parts) <= 1:
-        parts = [p for p in text.split(". ") if p.strip()]
-    return len(parts)
+# ADD: store de dedupe
+SEEN = SeenStore(path=os.getenv("SEEN_PATH", "seen.json"))
 
 
 def _has_sufficient_content(summary: str) -> bool:
@@ -80,93 +49,137 @@ def _has_sufficient_content(summary: str) -> bool:
         return False
     if len(summary) < max(0, MIN_CHARS):
         return False
-    if _count_paragraphs(summary) < max(1, MIN_PARAGRAPHS):
+    # parágrafos: 1 já passa no modo de volume
+    parts = [p for p in summary.replace("\r", "").split("\n\n") if p.strip()]
+    if len(parts) < max(1, MIN_PARAGRAPHS):
         return False
     return True
 
 
-def _publish_item(item: dict) -> None:
+def _format_payload(item: dict) -> dict:
     """
-    ADAPTE AQUI se você tem a sua função de publicação.
-    Atualmente só loga. No seu sistema, chame o plugin/camada que envia a matéria.
+    Mantém padrão editorial:
+    - título (original)
+    - resumo enxuto (1–2 frases)
+    - fonte (domínio)
+    - link
     """
-    logger.info(f"[PUBLISH] {item.get('title', '')} — {item.get('link', '')}")
+    title = item.get("title", "").strip()
+    link = item.get("link", "").strip()
+    summary = item.get("summary", "").strip()
+
+    fonte = domain_name(link)
+    resumo = summary
+
+    # se estiver longo demais, aparar (garante padrão)
+    if len(resumo) > 350:
+        cut = resumo[:350]
+        dot = cut.rfind(".")
+        resumo = cut[: dot + 1] if dot >= 120 else cut + "…"
+
+    return {
+        "regiao": REGIAO,
+        "keyword": item.get("keyword", ""),
+        "title": title,
+        "summary": resumo,
+        "fonte": fonte,
+        "link": link,
+        "published_iso": item.get("published_iso", ""),
+    }
 
 
-# -----------------------------------------------------------------------------
-# JOB
-# -----------------------------------------------------------------------------
+def _process_keyword(kw: str, per_run_limit: int):
+    try:
+        items, url = fetch_rss(kw, limit=per_run_limit)
+    except Exception as e:
+        logger.exception(f"[JOB] Erro em '{kw}': {e}")
+        return
+
+    if not items:
+        logger.info(f"[GNEWS] sem itens: {url}")
+        time.sleep(WAIT_GNEWS)
+        return
+
+    posted = 0
+
+    for it in items:
+        logger.info(f"[GNEWS] aguardando {WAIT_GNEWS}s: {it.get('link') or url}")
+        time.sleep(WAIT_GNEWS)
+
+        title = it.get("title", "") or ""
+        link = it.get("link", "") or ""
+        summary = it.get("summary", "") or ""
+        iso = it.get("published_iso", "")
+
+        sig = post_signature(title, link)
+        if SEEN.seen(sig):
+            logger.info(f"[SKIP] já publicado: {title}")
+            continue
+
+        recent_ok = is_recent(iso, RECENT_HOURS)
+
+        # Filtro e fallback de resumo
+        if not _has_sufficient_content(summary):
+            if ALLOW_SUMMARY_FALLBACK and link:
+                fallback = synthesize_summary_from_page(link)
+                if fallback and len(fallback) >= MIN_CHARS:
+                    summary = fallback
+
+        # Se ainda estiver curto ou não recente, pula
+        if not recent_ok or not _has_sufficient_content(summary):
+            logger.warning(
+                f"[JOB] Conteúdo insuficiente (kw: {kw}) em {(link or url)}"
+            )
+            continue
+
+        payload = _format_payload(
+            {
+                "keyword": kw,
+                "title": title,
+                "summary": summary,
+                "link": link,
+                "published_iso": iso,
+            }
+        )
+
+        # publica (adapte para o teu plugin)
+        _publish_item(payload)
+
+        SEEN.add(sig)
+        SEEN.save()
+        posted += 1
+
+        if FETCH_WAIT_SECONDS > 0:
+            time.sleep(FETCH_WAIT_SECONDS)
+
+    logger.info(f"[JOB] {kw}: publicados {posted}")
+
+
 def job_run():
     logger.info("[JOB] start")
 
-    for kw in KEYWORDS:
-        try:
-            items, url = fetch_rss(kw, limit=MAX_PER_RUN)
-        except Exception as e:
-            logger.exception(f"[JOB] Erro construindo/buscando feed para '{kw}': {e}")
-            continue
+    # 1) TIER PRIMÁRIO — litoral
+    for kw in KEYWORDS_PRIMARY:
+        _process_keyword(kw, MAX_PER_RUN_PRIMARY)
 
-        if not items:
-            logger.info(f"[GNEWS] sem itens: {url}")
-            time.sleep(WAIT_GNEWS)
-            continue
+    # 2) TIER SECUNDÁRIO — gerais
+    for kw in KEYWORDS_SECONDARY:
+        _process_keyword(kw, MAX_PER_RUN_SECONDARY)
 
-        # percorre itens retornados da busca
-        for it in items:
-            logger.info(f"[GNEWS] aguardando {WAIT_GNEWS}s: {it.get('link') or url}")
-            time.sleep(WAIT_GNEWS)
-
-            summary = it.get("summary", "") or ""
-            recent_ok = is_recent(it.get("published_iso", ""), RECENT_HOURS)
-
-            if not recent_ok or not _has_sufficient_content(summary):
-                logger.warning(
-                    f"[JOB] Conteúdo insuficiente (kw: {kw}) em "
-                    f"{(it.get('link') or url)}"
-                )
-                continue
-
-            # publica
-            _publish_item(
-                {
-                    "regiao": REGIAO,
-                    "keyword": kw,
-                    "title": it.get("title", ""),
-                    "link": it.get("link", ""),
-                    "summary": summary,
-                    "published_iso": it.get("published_iso", ""),
-                }
-            )
-
-            # espera entre publicações finais
-            if FETCH_WAIT_SECONDS > 0:
-                time.sleep(FETCH_WAIT_SECONDS)
+    # 3) Fallback absoluto (Top Stories) — se nada passou nos tiers
+    #    *Deixa comentado se não quiser usar*
+    # logger.info("[FALLBACK] Top Stories")
+    # try:
+    #     feed = feedparser.parse(TOPSTORIES_URL)
+    #     for entry in feed.entries[:MAX_PER_RUN_SECONDARY]:
+    #         fake_item = {
+    #             "title": entry.get("title", ""),
+    #             "link": entry.get("link", ""),
+    #             "summary": entry.get("summary", ""),
+    #             "published_iso": "",
+    #         }
+    #         _process_keyword("topstories", 0)  # reaproveita lógica se quiser
+    # except Exception as e:
+    #     logger.warning(f"[FALLBACK] erro: {e}")
 
     logger.info("[JOB] done")
-
-
-# -----------------------------------------------------------------------------
-# SCHEDULER
-# -----------------------------------------------------------------------------
-scheduler = BackgroundScheduler()
-
-
-def start_scheduler():
-    scheduler.add_job(job_run, "interval", minutes=max(1, RUN_INTERVAL_MIN))
-    scheduler.start()
-    logger.info("Scheduler iniciado")
-    # opcional: rodada imediata na subida
-    job_run()
-
-
-# -----------------------------------------------------------------------------
-# FLASK/WSGI opcional (se você já roda via outra app, pode remover)
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    try:
-        start_scheduler()
-        # Mantém o processo vivo
-        while True:
-            time.sleep(60)
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
